@@ -583,7 +583,8 @@ async function checkForUpdate(options = {}) {
   try {
     await storageSyncSet({ githubUpdateUrl: updateSourceUrl });
     const source = await resolveGithubUpdateSource(updateSourceUrl);
-    const latest = await fetchGithubManifest(source);
+    const latestFiles = await fetchGithubUpdateFiles(source);
+    const latest = parseManifestFromUpdateFiles(latestFiles);
     const currentVersion = chrome.runtime.getManifest().version;
     if (!isVersion(latest.version)) {
       throw new Error("GitHub 仓库里的 manifest.json 版本号格式不正确。");
@@ -596,6 +597,7 @@ async function checkForUpdate(options = {}) {
     }
 
     pendingUpdatePackage = {
+      files: latestFiles,
       source,
       type: "github",
       version: latest.version
@@ -667,18 +669,6 @@ async function resolveGithubUpdateSource(value) {
   return { ...source, branch: source.branch || "main" };
 }
 
-async function fetchGithubManifest(source) {
-  const response = await fetch(`${githubRawUrl(source, "manifest.json")}?pixmaxHubTs=${Date.now()}`);
-  if (!response.ok) {
-    throw new Error(await githubResponseError(response, "读取 GitHub manifest 失败"));
-  }
-  try {
-    return await response.json();
-  } catch {
-    throw new Error("GitHub 仓库里的 manifest.json 无法解析。");
-  }
-}
-
 async function fetchGithubUpdateFiles(source) {
   const response = await fetch(githubTarballUrl(source));
   if (!response.ok) {
@@ -687,6 +677,16 @@ async function fetchGithubUpdateFiles(source) {
   const compressedBytes = new Uint8Array(await response.arrayBuffer());
   const archiveBytes = await ungzip(compressedBytes);
   return parseGithubTarArchive(archiveBytes);
+}
+
+function parseManifestFromUpdateFiles(files) {
+  const bytes = files.get("manifest.json");
+  if (!bytes) throw new Error("GitHub 更新包缺少 manifest.json。");
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    throw new Error("GitHub 更新包里的 manifest.json 无法解析。");
+  }
 }
 
 async function githubResponseError(response, fallback) {
@@ -704,13 +704,6 @@ function encodeGithubPath(path) {
     .split("/")
     .map((part) => encodeURIComponent(part))
     .join("/");
-}
-
-function githubRawUrl(source, path) {
-  return (
-    `https://raw.githubusercontent.com/${encodeURIComponent(source.owner)}` +
-    `/${encodeURIComponent(source.repo)}/${encodeGithubPath(source.branch)}/${encodeGithubPath(path)}`
-  );
 }
 
 function githubTarballUrl(source) {
@@ -734,7 +727,7 @@ async function applyPendingUpdate() {
     const directory = await getWritableUpdateDirectory();
     setUpdateBusy(true, "安装中...");
 
-    const files = await fetchGithubUpdateFiles(pendingUpdatePackage.source);
+    const files = pendingUpdatePackage.files || await fetchGithubUpdateFiles(pendingUpdatePackage.source);
     validateUpdateFiles(files);
     await writeUpdateFiles(directory, files);
 
