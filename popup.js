@@ -15,20 +15,24 @@ const DEFAULT_DATABASE_URL =
 const DEFAULT_GITHUB_UPDATE_URL = "https://github.com/171896542/PixmaxHub-Plug";
 const DEFAULT_LIKE_COLOR = "#ff3864";
 const CANVAS_REVISION_CONFLICT = "Canvas.Revision.Conflict";
-const ALLOWED_UPDATE_FILES = new Set([
-  "manifest.json",
-  "bridge.js",
-  "content.js",
-  "relay.js",
-  "background.js",
-  "popup.html",
-  "popup.css",
-  "popup.js",
-  "likes.html",
-  "likes.css",
-  "likes.js",
-  "README.md"
+const UPDATE_FILE_EXTENSIONS = new Set([
+  ".css",
+  ".gif",
+  ".html",
+  ".ico",
+  ".jpeg",
+  ".jpg",
+  ".js",
+  ".json",
+  ".md",
+  ".png",
+  ".svg",
+  ".txt",
+  ".webp",
+  ".woff",
+  ".woff2"
 ]);
+const IGNORED_UPDATE_DIRECTORIES = new Set([".git", ".github", "node_modules"]);
 
 const DEFAULT_OPTIONS = {
   eagleFolderId: "",
@@ -663,11 +667,45 @@ async function fetchGithubManifest(source) {
 
 async function fetchGithubUpdateFiles(source) {
   const files = new Map();
-  for (const path of ALLOWED_UPDATE_FILES) {
+  await fetchGithubRepositoryFiles(source, "", files);
+  return files;
+}
+
+async function fetchGithubRepositoryFiles(source, directoryPath, files) {
+  const apiUrl =
+    `https://api.github.com/repos/${encodeURIComponent(source.owner)}` +
+    `/${encodeURIComponent(source.repo)}/contents/${encodeGithubPath(directoryPath)}` +
+    `?ref=${encodeURIComponent(source.branch)}`;
+  const response = await fetch(apiUrl);
+  if (!response.ok) {
+    throw new Error(await githubResponseError(response, `读取 GitHub 目录失败：${directoryPath || "/"}`));
+  }
+
+  const entries = await response.json();
+  if (!Array.isArray(entries)) return;
+
+  for (const entry of entries) {
+    const path = String(entry?.path || "");
+    if (!path || shouldIgnoreUpdatePath(path)) continue;
+
+    if (entry.type === "dir") {
+      await fetchGithubRepositoryFiles(source, path, files);
+      continue;
+    }
+
+    if (entry.type !== "file" || !isUpdatableRepositoryPath(path)) continue;
+    if (entry.download_url) {
+      const rawResponse = await fetch(entry.download_url);
+      if (!rawResponse.ok) {
+        throw new Error(await githubResponseError(rawResponse, `下载 GitHub 文件失败：${path}`));
+      }
+      files.set(path, new Uint8Array(await rawResponse.arrayBuffer()));
+      continue;
+    }
+
     const bytes = await fetchGithubContentBytes(source, path);
     if (bytes) files.set(path, bytes);
   }
-  return files;
 }
 
 async function fetchGithubContentBytes(source, path) {
@@ -887,12 +925,33 @@ function base64ToBytes(value) {
   return bytes;
 }
 
+function shouldIgnoreUpdatePath(path) {
+  const parts = String(path || "").split("/");
+  return parts.some((part) => IGNORED_UPDATE_DIRECTORIES.has(part));
+}
+
+function isUpdatableRepositoryPath(path) {
+  const normalized = String(path || "").replace(/\\/g, "/");
+  const parts = normalized.split("/");
+  if (!normalized || normalized.startsWith("/") || normalized.endsWith("/")) return false;
+  if (parts.some((part) => !part || part === "." || part === ".." || part.startsWith("."))) {
+    return false;
+  }
+
+  const filename = parts[parts.length - 1] || "";
+  if (filename === "manifest.json") return true;
+
+  const dotIndex = filename.lastIndexOf(".");
+  const extension = dotIndex >= 0 ? filename.slice(dotIndex).toLowerCase() : "";
+  return UPDATE_FILE_EXTENSIONS.has(extension);
+}
+
 function validateUpdateFiles(files) {
   if (!files.size) throw new Error("更新包里没有文件。");
   if (!files.has("manifest.json")) throw new Error("更新包缺少 manifest.json。");
 
   for (const path of files.keys()) {
-    if (!ALLOWED_UPDATE_FILES.has(path)) {
+    if (!isUpdatableRepositoryPath(path)) {
       throw new Error(`更新包包含不允许写入的文件：${path}`);
     }
   }
@@ -900,11 +959,21 @@ function validateUpdateFiles(files) {
 
 async function writeUpdateFiles(directory, files) {
   for (const [path, bytes] of files) {
-    const handle = await directory.getFileHandle(path, { create: true });
+    const handle = await getNestedFileHandle(directory, path);
     const writable = await handle.createWritable();
     await writable.write(bytes);
     await writable.close();
   }
+}
+
+async function getNestedFileHandle(rootDirectory, path) {
+  const parts = String(path || "").split("/").filter(Boolean);
+  const filename = parts.pop();
+  let directory = rootDirectory;
+  for (const part of parts) {
+    directory = await directory.getDirectoryHandle(part, { create: true });
+  }
+  return directory.getFileHandle(filename, { create: true });
 }
 
 function setUpdateBusy(busy, text = "") {
