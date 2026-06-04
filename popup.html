@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>PixmaxHub Plug</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <h1>PixmaxHub Plug</h1>
+      <button id="openLikes" class="secondary primary-action" type="button">Open Likes</button>
+      <label for="eagleFolder">Eagle 目录</label>
+      <div class="row">
+        <select id="eagleFolder">
+          <option value="">请先刷新目录</option>
+        </select>
+        <button id="refreshFolders" type="button" title="刷新 Eagle 目录">刷新</button>
+      </div>
+      <p id="status" class="status">请先打开 Eagle App，再刷新目录。</p>
+
+      <details class="section">
+        <summary>用户与共享 Likes</summary>
+        <label class="check">
+          <input id="sharedLikesEnabled" type="checkbox">
+          <span>使用共享画布文字节点同步收藏</span>
+        </label>
+        <label for="sharedLikesCanvasUrl">数据库链接</label>
+        <input id="sharedLikesCanvasUrl" type="url" placeholder="https://app.pixmax.cn/workspace/...?...file=...">
+        <label for="sharedLikesOwnerName">我的名字</label>
+        <input id="sharedLikesOwnerName" type="text" placeholder="例如 rucker测试版本">
+        <label for="sharedLikesColor">我的颜色</label>
+        <div class="color-row">
+          <input id="sharedLikesColor" type="color" value="#ff3864" aria-label="我的颜色">
+          <span id="sharedLikesColorText">#ff3864</span>
+        </div>
+        <button id="createSharedUser" class="secondary" type="button" disabled>创建用户</button>
+        <button id="saveSharedLikes" class="secondary" type="button">保存共享设置</button>
+        <p id="sharedStatus" class="status">在共享画布里创建一个同名文字节点后启用。</p>
+      </details>
+
+      <details class="section">
+        <summary>在线更新</summary>
+        <p>从 GitHub 仓库检测 manifest 版本，点击后下载并替换当前本地扩展文件夹。</p>
+        <label for="githubUpdateUrl">GitHub 更新源</label>
+        <input id="githubUpdateUrl" type="url" placeholder="https://github.com/owner/repo 或 .../tree/main">
+        <p id="updateDirectory" class="status">未记住更新目录</p>
+        <div class="update-controls">
+          <button id="chooseUpdateDirectory" class="secondary" type="button">选择/更换更新目录</button>
+          <div class="row update-row">
+            <button id="checkUpdate" class="secondary compact" type="button">检查更新</button>
+            <button id="applyUpdate" class="secondary compact" type="button" disabled>安装更新</button>
+          </div>
+        </div>
+        <p id="updateStatus" class="status">请填写 GitHub 仓库地址后检查更新。</p>
+      </details>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

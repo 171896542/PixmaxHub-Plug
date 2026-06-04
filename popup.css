@@ -1,0 +1,166 @@
+:root {
+  color-scheme: dark;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+body {
+  margin: 0;
+  background: #151618;
+  color: #f3f4f6;
+}
+
+main {
+  box-sizing: border-box;
+  width: 320px;
+  padding: 14px;
+}
+
+h1 {
+  margin: 0 0 6px;
+  font-size: 16px;
+}
+
+p,
+label {
+  color: #a9adb5;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+label {
+  display: block;
+  margin: 14px 0 6px;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+}
+
+select,
+input,
+button {
+  min-height: 34px;
+  box-sizing: border-box;
+  border: 1px solid #3c4148;
+  border-radius: 7px;
+  background: #23262b;
+  color: #f3f4f6;
+  font: inherit;
+}
+
+select,
+input[type="url"],
+input[type="text"] {
+  min-width: 0;
+  width: 100%;
+  padding: 0 8px;
+}
+
+input[type="color"] {
+  width: 44px;
+  padding: 3px;
+}
+
+.color-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+#sharedLikesColorText {
+  color: #f3f4f6;
+  font-size: 12px;
+}
+
+select {
+  flex: 1;
+}
+
+button {
+  cursor: pointer;
+  padding: 0 12px;
+}
+
+button:hover {
+  background: #30343a;
+}
+
+button.secondary {
+  width: 100%;
+  margin-top: 14px;
+}
+
+button.primary-action {
+  margin: 8px 0 4px;
+  border-color: #75e9f4;
+  background: #174149;
+  color: #75e9f4;
+}
+
+button.compact {
+  margin-top: 0;
+  width: auto;
+  flex: 1;
+}
+
+.update-controls {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.update-controls button.secondary {
+  margin-top: 0;
+}
+
+.update-row {
+  gap: 10px;
+}
+
+button:disabled,
+select:disabled {
+  cursor: not-allowed;
+  opacity: .55;
+}
+
+.status {
+  margin: 10px 0 0;
+}
+
+.status.success {
+  color: #75e9f4;
+}
+
+.status.error {
+  color: #ff9a92;
+}
+
+.section {
+  margin-top: 16px;
+  border-top: 1px solid #30343a;
+  padding-top: 14px;
+}
+
+summary {
+  cursor: pointer;
+  color: #f3f4f6;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+details[open] summary {
+  margin-bottom: 8px;
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 10px;
+}
+
+.check input {
+  width: 16px;
+  min-height: 16px;
+}

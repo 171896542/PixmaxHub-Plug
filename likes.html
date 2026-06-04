@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Pixmax Review Board</title>
+    <link rel="stylesheet" href="likes.css">
+  </head>
+  <body>
+    <header>
+      <div>
+        <h1>Pixmax Review Board</h1>
+        <p id="count">Loading...</p>
+      </div>
+      <div class="header-actions">
+        <button id="togglePrompts" type="button">显示提示词</button>
+        <button id="multiSelect" type="button">多选存入 Eagle</button>
+        <button id="batchEagle" type="button" disabled>批量存入 Eagle</button>
+        <button id="exportHtml" type="button">Export HTML</button>
+        <button id="exportJson" type="button">Export JSON</button>
+        <button id="clearLikes" type="button">Clear All</button>
+      </div>
+    </header>
+
+    <section class="review-controls" aria-label="Review filters">
+      <label class="search-field">
+        <span>搜索</span>
+        <input id="searchLikes" type="search" placeholder="名称、提示词、成员、标签、评论">
+      </label>
+      <div class="status-filter" role="group" aria-label="Review status">
+        <button type="button" data-status-filter="all" aria-pressed="true">全部</button>
+        <button type="button" data-status-filter="pick">入选</button>
+        <button type="button" data-status-filter="maybe">待定</button>
+        <button type="button" data-status-filter="reject">淘汰</button>
+        <button type="button" data-status-filter="unreviewed">未审</button>
+      </div>
+    </section>
+    <section id="reviewStats" class="review-stats" aria-label="Review summary"></section>
+    <nav id="ownerFilters" class="owner-filters" aria-label="Shared Like owners"></nav>
+
+    <main id="likesGrid" class="grid"></main>
+
+    <template id="likeTemplate">
+      <article class="card">
+        <label class="select-card" title="选择这个收藏">
+          <input class="select-like" type="checkbox">
+        </label>
+        <span class="badge" aria-label="Liked">♥</span>
+        <div class="preview-wrap">
+          <a class="preview" target="_blank" rel="noreferrer"></a>
+          <div class="review-ribbon" hidden></div>
+        </div>
+        <div class="body">
+          <h2></h2>
+          <p class="prompt"></p>
+          <p class="meta"></p>
+          <div class="actions">
+            <a class="open" target="_blank" rel="noreferrer">Open</a>
+            <button class="copy" type="button">Copy URL</button>
+            <button class="eagle" type="button">存入 Eagle</button>
+            <button class="remove" type="button">Remove</button>
+          </div>
+          <section class="review-panel" hidden>
+            <div class="review-statuses" role="group" aria-label="Review decision">
+              <button type="button" data-review-status="pick">入选</button>
+              <button type="button" data-review-status="maybe">待定</button>
+              <button type="button" data-review-status="reject">淘汰</button>
+            </div>
+            <div class="review-tags"></div>
+            <form class="tag-form">
+              <input class="tag-input" type="text" maxlength="120" placeholder="添加标签，用逗号分隔">
+              <button class="tag-submit" type="submit">添加</button>
+            </form>
+          </section>
+          <section class="social" hidden>
+            <div class="social-bar">
+              <button class="social-like" type="button">赞</button>
+              <button class="comment-toggle" type="button">评论</button>
+              <div class="social-likers"></div>
+            </div>
+            <div class="comments"></div>
+            <form class="comment-form" hidden>
+              <span class="avatar my-avatar"></span>
+              <input class="comment-input" type="text" maxlength="500" placeholder="留言...">
+              <button class="comment-submit" type="submit">发送</button>
+            </form>
+          </section>
+        </div>
+      </article>
+    </template>
+    <script src="likes.js"></script>
+  </body>
+</html>
