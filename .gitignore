@@ -1,0 +1,4 @@
+.DS_Store
+node_modules/
+*.log
+pixmax-update-node-*.txt
