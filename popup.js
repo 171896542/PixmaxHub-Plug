@@ -668,7 +668,7 @@ async function resolveGithubUpdateSource(value) {
 }
 
 async function fetchGithubManifest(source) {
-  const response = await fetch(githubRawUrl(source, "manifest.json"));
+  const response = await fetch(`${githubRawUrl(source, "manifest.json")}?pixmaxHubTs=${Date.now()}`);
   if (!response.ok) {
     throw new Error(await githubResponseError(response, "读取 GitHub manifest 失败"));
   }

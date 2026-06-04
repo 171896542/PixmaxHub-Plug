@@ -450,7 +450,9 @@
       const source = parseGithubUpdateUrl(normalizeGithubUpdateUrl(options.githubUpdateUrl));
       if (!source) return;
 
-      const response = await fetch(githubRawManifestUrl({ ...source, branch: source.branch || "main" }));
+      const response = await fetch(
+        `${githubRawManifestUrl({ ...source, branch: source.branch || "main" })}?pixmaxHubTs=${Date.now()}`
+      );
       if (!response.ok) return;
       const manifest = await response.json();
       const latestVersion = String(manifest.version || "");
