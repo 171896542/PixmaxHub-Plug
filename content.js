@@ -15,6 +15,9 @@
   const STYLE_VERSION = "1.2.10";
   const TOAST_ID = "pixmax-canvas-cloner-toast";
   const LIKES_STORAGE_KEY = "pixmaxLikedItems";
+  const UPDATE_CHECK_STORAGE_KEY = "pixmaxHubUpdateReminder";
+  const DEFAULT_GITHUB_UPDATE_URL = "https://github.com/171896542/PixmaxHub-Plug/tree/main";
+  const UPDATE_REMINDER_INTERVAL_MS = 6 * 60 * 60 * 1000;
   const DEFAULT_LIKE_COLOR = "#ff3864";
   const SHARED_OPTIONS_DEFAULTS = {
     sharedLikesEnabled: false,
@@ -355,6 +358,117 @@
     return /^#[0-9a-f]{6}$/i.test(color) ? color.toLowerCase() : DEFAULT_LIKE_COLOR;
   }
 
+  function normalizeGithubUpdateUrl(value) {
+    const source = parseGithubUpdateUrl(value);
+    if (!source) return DEFAULT_GITHUB_UPDATE_URL;
+
+    const isDefaultRepository =
+      source.owner === "171896542" && source.repo.toLowerCase() === "pixmaxhub-plug";
+    const branch = isDefaultRepository && (!source.branch || source.branch === "master")
+      ? "main"
+      : source.branch;
+
+    return branch
+      ? `https://github.com/${source.owner}/${source.repo}/tree/${branch}`
+      : `https://github.com/${source.owner}/${source.repo}`;
+  }
+
+  function parseGithubUpdateUrl(value) {
+    const text = String(value || "")
+      .trim()
+      .replace(/^www\.github\.com\//i, "")
+      .replace(/^github\.com\//i, "");
+    if (!text) return null;
+
+    let url;
+    try {
+      url = new URL(text.startsWith("http") ? text : `https://github.com/${text}`);
+    } catch {
+      return null;
+    }
+
+    if (url.hostname !== "github.com" && url.hostname !== "www.github.com") return null;
+
+    const parts = url.pathname
+      .replace(/^\/+|\/+$/g, "")
+      .split("/")
+      .filter(Boolean);
+    if (parts.length < 2) return null;
+
+    const owner = parts[0];
+    const repo = parts[1].replace(/\.git$/i, "");
+    const treeIndex = parts.indexOf("tree");
+    const branch = treeIndex >= 0 ? parts.slice(treeIndex + 1).join("/") : "";
+    if (!/^[0-9A-Za-z_.-]+$/.test(owner) || !/^[0-9A-Za-z_.-]+$/.test(repo)) return null;
+    return { owner, repo, branch };
+  }
+
+  function githubRawManifestUrl(source) {
+    return (
+      `https://raw.githubusercontent.com/${encodeURIComponent(source.owner)}` +
+      `/${encodeURIComponent(source.repo)}/${encodeGithubPath(source.branch || "main")}/manifest.json`
+    );
+  }
+
+  function encodeGithubPath(path) {
+    return String(path || "")
+      .split("/")
+      .map((part) => encodeURIComponent(part))
+      .join("/");
+  }
+
+  function isVersion(value) {
+    return /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(String(value || ""));
+  }
+
+  function compareVersions(first, second) {
+    const firstParts = String(first || "").split(/[.+-]/).map((part) => Number(part) || 0);
+    const secondParts = String(second || "").split(/[.+-]/).map((part) => Number(part) || 0);
+    const length = Math.max(firstParts.length, secondParts.length, 3);
+    for (let index = 0; index < length; index += 1) {
+      const delta = (firstParts[index] || 0) - (secondParts[index] || 0);
+      if (delta !== 0) return delta;
+    }
+    return 0;
+  }
+
+  async function maybeRemindAboutUpdate() {
+    try {
+      const state = await storageGet({ [UPDATE_CHECK_STORAGE_KEY]: { checkedAt: 0, version: "" } });
+      const reminder = state[UPDATE_CHECK_STORAGE_KEY] || {};
+      const now = Date.now();
+      if (now - (Number(reminder.checkedAt) || 0) < UPDATE_REMINDER_INTERVAL_MS) return;
+
+      await storageSet({
+        [UPDATE_CHECK_STORAGE_KEY]: {
+          checkedAt: now,
+          version: String(reminder.version || "")
+        }
+      });
+
+      const options = await syncStorageGet({ githubUpdateUrl: DEFAULT_GITHUB_UPDATE_URL });
+      const source = parseGithubUpdateUrl(normalizeGithubUpdateUrl(options.githubUpdateUrl));
+      if (!source) return;
+
+      const response = await fetch(githubRawManifestUrl({ ...source, branch: source.branch || "main" }));
+      if (!response.ok) return;
+      const manifest = await response.json();
+      const latestVersion = String(manifest.version || "");
+      const currentVersion = globalThis.chrome?.runtime?.getManifest?.().version || "";
+      if (!isVersion(latestVersion) || compareVersions(latestVersion, currentVersion) <= 0) return;
+
+      await storageSet({
+        [UPDATE_CHECK_STORAGE_KEY]: {
+          checkedAt: now,
+          version: latestVersion
+        }
+      });
+      showToast(`PixmaxHub Plug 有新版本 ${latestVersion}，请打开扩展弹窗安装更新。`);
+    } catch {
+      // 收藏动作不应该被更新提醒影响。
+    }
+  }
+
   function hexToRgb(color) {
     const normalized = normalizeColor(color).slice(1);
     return [
@@ -675,6 +789,7 @@
         setLikeButtonState(button, ownLikedKeys.has(likeKey), likedColors.get(likeKey));
         applyVisibleLikedMarks();
         showToast(result.liked ? "Added to shared Likes." : "Removed from shared Likes.");
+        window.setTimeout(maybeRemindAboutUpdate, 800);
         return;
       }
 
@@ -690,6 +805,7 @@
         setLikeButtonState(button, false);
         applyNodeLikedState(item.nodeId, false);
         showToast("Removed from Likes.");
+        window.setTimeout(maybeRemindAboutUpdate, 800);
         return;
       }
 
@@ -706,6 +822,7 @@
       setLikeButtonState(button, true, DEFAULT_LIKE_COLOR);
       applyNodeLikedState(item.nodeId, true, DEFAULT_LIKE_COLOR);
       showToast("Added to Likes.");
+      window.setTimeout(maybeRemindAboutUpdate, 800);
     } catch (error) {
       showToast(error.message, true);
     } finally {

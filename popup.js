@@ -87,7 +87,10 @@ function init() {
     sharedLikesOwnerName.value = options.sharedLikesOwnerName || "";
     sharedLikesColor.value = normalizeColor(options.sharedLikesColor);
     sharedLikesColorText.textContent = sharedLikesColor.value;
-    githubUpdateUrl.value = options.githubUpdateUrl || DEFAULT_GITHUB_UPDATE_URL;
+    githubUpdateUrl.value = normalizeGithubUpdateUrl(options.githubUpdateUrl || DEFAULT_GITHUB_UPDATE_URL);
+    if (githubUpdateUrl.value !== options.githubUpdateUrl) {
+      storageSyncSet({ githubUpdateUrl: githubUpdateUrl.value }).catch(() => {});
+    }
     if (options.sharedLikesEnabled && options.sharedLikesFileUuid && options.sharedLikesOwnerName) {
       setSharedStatus("已启用共享 Likes。", "success");
     }
@@ -225,7 +228,8 @@ function saveSharedLikesOptions() {
 }
 
 function saveGithubUpdateUrl() {
-  const value = githubUpdateUrl.value.trim();
+  const value = normalizeGithubUpdateUrl(githubUpdateUrl.value);
+  githubUpdateUrl.value = value;
   storageSyncSet({ githubUpdateUrl: value }).catch((error) => {
     setUpdateStatus(error.message || String(error), "error");
   });
@@ -637,6 +641,21 @@ function parseGithubUpdateUrl(value) {
   if (!/^[0-9A-Za-z_.-]+$/.test(owner) || !/^[0-9A-Za-z_.-]+$/.test(repo)) return null;
 
   return { owner, repo, branch };
+}
+
+function normalizeGithubUpdateUrl(value) {
+  const source = parseGithubUpdateUrl(value);
+  if (!source) return String(value || "").trim() || DEFAULT_GITHUB_UPDATE_URL;
+
+  const isDefaultRepository =
+    source.owner === "171896542" && source.repo.toLowerCase() === "pixmaxhub-plug";
+  const branch = isDefaultRepository && (!source.branch || source.branch === "master")
+    ? "main"
+    : source.branch;
+
+  return branch
+    ? `https://github.com/${source.owner}/${source.repo}/tree/${branch}`
+    : `https://github.com/${source.owner}/${source.repo}`;
 }
 
 async function resolveGithubUpdateSource(value) {
