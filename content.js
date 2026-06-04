@@ -74,6 +74,11 @@
       return;
     }
 
+    if (event.data.notification === "shared-like-index-error") {
+      showToast(`收藏已保存，但索引同步失败：${event.data.payload?.error || "未知错误"}`, true);
+      return;
+    }
+
     const pending = requests.get(event.data.requestId);
     if (!pending) return;
 
@@ -195,6 +200,11 @@
         font: 12px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       }
       #${TOAST_ID}.error { color: #ff9a92; }
+      #${TOAST_ID}.persistent {
+        border-color: #f8d66d;
+        background: #211c10f5;
+        color: #f8d66d;
+      }
     `;
     document.head.appendChild(style);
   }
@@ -225,7 +235,7 @@
     });
   }
 
-  function showToast(message, error = false) {
+  function showToast(message, error = false, options = {}) {
     let toast = document.getElementById(TOAST_ID);
     if (!toast) {
       toast = document.createElement("div");
@@ -235,8 +245,11 @@
 
     toast.textContent = message;
     toast.classList.toggle("error", error);
+    toast.classList.toggle("persistent", Boolean(options.persistent));
     window.clearTimeout(toastTimer);
-    toastTimer = window.setTimeout(() => toast.remove(), 3500);
+    if (!options.persistent) {
+      toastTimer = window.setTimeout(() => toast.remove(), options.duration || 3500);
+    }
   }
 
   async function runAction(action, button) {
@@ -432,10 +445,24 @@
     return 0;
   }
 
+  function showUpdateRequiredToast(version) {
+    showToast(
+      `PixmaxHub Plug 有新版本 ${version}，请打开扩展弹窗安装更新后再继续使用。`,
+      false,
+      { persistent: true }
+    );
+  }
+
   async function maybeRemindAboutUpdate() {
     try {
       const state = await storageGet({ [UPDATE_CHECK_STORAGE_KEY]: { checkedAt: 0, version: "" } });
       const reminder = state[UPDATE_CHECK_STORAGE_KEY] || {};
+      const currentVersion = globalThis.chrome?.runtime?.getManifest?.().version || "";
+      if (isVersion(reminder.version) && compareVersions(reminder.version, currentVersion) > 0) {
+        showUpdateRequiredToast(reminder.version);
+        return;
+      }
+
       const now = Date.now();
       if (now - (Number(reminder.checkedAt) || 0) < UPDATE_REMINDER_INTERVAL_MS) return;
 
@@ -456,7 +483,6 @@
       if (!response.ok) return;
       const manifest = await response.json();
       const latestVersion = String(manifest.version || "");
-      const currentVersion = globalThis.chrome?.runtime?.getManifest?.().version || "";
       if (!isVersion(latestVersion) || compareVersions(latestVersion, currentVersion) <= 0) return;
 
       await storageSet({
@@ -465,7 +491,7 @@
           version: latestVersion
         }
       });
-      showToast(`PixmaxHub Plug 有新版本 ${latestVersion}，请打开扩展弹窗安装更新。`);
+      showUpdateRequiredToast(latestVersion);
     } catch {
       // 收藏动作不应该被更新提醒影响。
     }
@@ -779,17 +805,32 @@
           },
           20000
         );
-        const allKeys = Array.isArray(result.allKeys)
-          ? result.allKeys
-          : (Array.isArray(result.allItems) ? result.allItems : []).map(getLikeKey).filter(Boolean);
-        const ownKeys = Array.isArray(result.ownKeys)
-          ? result.ownKeys
-          : (Array.isArray(result.ownItems) ? result.ownItems : []).map(getLikeKey).filter(Boolean);
-        likedKeys = new Set(allKeys);
-        ownLikedKeys = new Set(ownKeys);
-        likedColors = buildColorMap(result);
-        setLikeButtonState(button, ownLikedKeys.has(likeKey), likedColors.get(likeKey));
-        applyVisibleLikedMarks();
+        if (result.partialState) {
+          if (result.liked) {
+            likedKeys.add(likeKey);
+            ownLikedKeys.add(likeKey);
+            likedColors.set(likeKey, sharedOptions.color);
+          } else {
+            likedKeys.delete(likeKey);
+            ownLikedKeys.delete(likeKey);
+            likedColors.delete(likeKey);
+          }
+          setLikeButtonState(button, result.liked, sharedOptions.color);
+          applyNodeLikedState(item.nodeId, result.liked, sharedOptions.color);
+          window.setTimeout(refreshLikedState, 2200);
+        } else {
+          const allKeys = Array.isArray(result.allKeys)
+            ? result.allKeys
+            : (Array.isArray(result.allItems) ? result.allItems : []).map(getLikeKey).filter(Boolean);
+          const ownKeys = Array.isArray(result.ownKeys)
+            ? result.ownKeys
+            : (Array.isArray(result.ownItems) ? result.ownItems : []).map(getLikeKey).filter(Boolean);
+          likedKeys = new Set(allKeys);
+          ownLikedKeys = new Set(ownKeys);
+          likedColors = buildColorMap(result);
+          setLikeButtonState(button, ownLikedKeys.has(likeKey), likedColors.get(likeKey));
+          applyVisibleLikedMarks();
+        }
         showToast(result.liked ? "Added to shared Likes." : "Removed from shared Likes.");
         window.setTimeout(maybeRemindAboutUpdate, 800);
         return;

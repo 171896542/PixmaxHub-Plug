@@ -351,14 +351,20 @@
   }
 
   function getOwnerLikeIndexLabel(ownerName) {
+    return `${ownerName} 索引`;
+  }
+
+  function getLegacyOwnerLikeIndexLabel(ownerName) {
     return `${LIKE_INDEX_NODE_LABEL} - ${ownerName}`;
   }
 
   function findOwnerLikeIndexNode(nodes, ownerName) {
     const ownerLabel = getOwnerLikeIndexLabel(ownerName);
+    const legacyOwnerLabel = getLegacyOwnerLikeIndexLabel(ownerName);
     const entries = findLikeIndexNodes(nodes);
     return (
       entries.find((entry) => getRawNodeLabel(entry.node) === ownerLabel)?.node ||
+      entries.find((entry) => getRawNodeLabel(entry.node) === legacyOwnerLabel)?.node ||
       entries.find((entry) => {
         const owners = normalizeLikeIndex(entry.index).owners;
         return owners.length === 1 && owners[0].ownerName === ownerName;
@@ -391,6 +397,7 @@
     if (
       label === LIKE_INDEX_NODE_LABEL ||
       label.startsWith(`${LIKE_INDEX_NODE_LABEL} - `) ||
+      label.endsWith(" 索引") ||
       label === SOCIAL_DATA_NODE_LABEL ||
       label.startsWith("Pixmax 更新包")
     ) {
@@ -543,6 +550,24 @@
     return getSharedStateFromLikeIndexNodes(nextCanvas.nodes ?? [], ownerName);
   }
 
+  async function syncLikeIndexForOwnerLater(fileUuid, ownerName, color, items) {
+    try {
+      const canvas = await fetchCanvas(fileUuid);
+      await upsertLikeIndexForOwner(fileUuid, canvas, ownerName, color, items);
+    } catch (error) {
+      window.postMessage(
+        {
+          source: RESPONSE_SOURCE,
+          notification: "shared-like-index-error",
+          payload: {
+            error: error.message || String(error)
+          }
+        },
+        location.origin
+      );
+    }
+  }
+
   function getSharedLikeStateFromCanvas(canvas, ownerName) {
     return getSharedStateFromLikeIndexNodes(canvas.nodes ?? [], ownerName);
   }
@@ -641,17 +666,31 @@
       throw new Error(updateResult.errMessage || updateResult.errCode || "共享 Likes 写入失败。");
     }
 
-    const nextCanvas = await fetchCanvas(fileUuid);
-    let state;
-    try {
-      state = await upsertLikeIndexForOwner(fileUuid, nextCanvas, ownerName, ownerColor, ownItems);
-    } catch {
-      state = getSharedLikeStateFromCanvas(nextCanvas, ownerName);
-    }
+    window.setTimeout(() => syncLikeIndexForOwnerLater(fileUuid, ownerName, ownerColor, ownItems), 0);
+    const state = getSharedStateFromLikeIndex({
+      owners: [
+        {
+          color: ownerColor,
+          keys: ownItems.map(getLikeKey).filter(Boolean),
+          ownerName
+        }
+      ]
+    }, ownerName);
     return {
       ...(payload?.lightweight
-        ? state
-        : getSharedLikesFromCanvas(nextCanvas, ownerName)),
+        ? {
+            ...state,
+            partialState: true
+          }
+        : {
+            ...state,
+            allItems: ownItems.map((ownItem) => ({
+              ...ownItem,
+              likedBy: ownerName,
+              likedByColor: ownerColor
+            })),
+            ownItems
+          }),
       liked
     };
   }

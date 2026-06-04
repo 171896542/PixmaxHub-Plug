@@ -1137,14 +1137,20 @@ function findLikeIndexNodes(nodes) {
 }
 
 function getOwnerLikeIndexLabel(ownerName) {
+  return `${ownerName} 索引`;
+}
+
+function getLegacyOwnerLikeIndexLabel(ownerName) {
   return `${LIKE_INDEX_NODE_LABEL} - ${ownerName}`;
 }
 
 function findOwnerLikeIndexNode(nodes, ownerName) {
   const ownerLabel = getOwnerLikeIndexLabel(ownerName);
+  const legacyOwnerLabel = getLegacyOwnerLikeIndexLabel(ownerName);
   const entries = findLikeIndexNodes(nodes);
   return (
     entries.find((entry) => getRawNodeLabel(entry.node) === ownerLabel)?.node ||
+    entries.find((entry) => getRawNodeLabel(entry.node) === legacyOwnerLabel)?.node ||
     entries.find((entry) => {
       const owners = normalizeLikeIndex(entry.index).owners;
       return owners.length === 1 && owners[0].ownerName === ownerName;
