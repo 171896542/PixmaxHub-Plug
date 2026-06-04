@@ -12,7 +12,7 @@ const UPDATE_DIRECTORY_KEY = "extensionDirectory";
 const UPDATE_DIRECTORY_LABEL_KEY = "pixmaxUpdateDirectoryLabel";
 const DEFAULT_DATABASE_URL =
   "https://app.pixmax.cn/workspace/3bba9785-24d6-4b1f-84c1-895d85db4bbe?file=1f14fa50-bdeb-6eaf-9168-47138a4a9766";
-const DEFAULT_GITHUB_UPDATE_URL = "https://github.com/171896542/PixmaxHub-Plug";
+const DEFAULT_GITHUB_UPDATE_URL = "https://github.com/171896542/PixmaxHub-Plug/tree/main";
 const DEFAULT_LIKE_COLOR = "#ff3864";
 const CANVAS_REVISION_CONFLICT = "Canvas.Revision.Conflict";
 const UPDATE_FILE_EXTENSIONS = new Set([
@@ -645,97 +645,29 @@ async function resolveGithubUpdateSource(value) {
     throw new Error("GitHub 更新源格式不正确，请填写 https://github.com/owner/repo。");
   }
 
-  if (source.branch) return source;
-
-  const repository = await fetchGithubJson(
-    `https://api.github.com/repos/${encodeURIComponent(source.owner)}/${encodeURIComponent(source.repo)}`
-  );
-  const branch = String(repository.default_branch || "").trim();
-  if (!branch) throw new Error("无法读取 GitHub 仓库默认分支。");
-  return { ...source, branch };
+  return { ...source, branch: source.branch || "main" };
 }
 
 async function fetchGithubManifest(source) {
-  const bytes = await fetchGithubContentBytes(source, "manifest.json");
-  if (!bytes) throw new Error("GitHub 仓库根目录没有找到 manifest.json。");
+  const response = await fetch(githubRawUrl(source, "manifest.json"));
+  if (!response.ok) {
+    throw new Error(await githubResponseError(response, "读取 GitHub manifest 失败"));
+  }
   try {
-    return JSON.parse(new TextDecoder().decode(bytes));
+    return await response.json();
   } catch {
     throw new Error("GitHub 仓库里的 manifest.json 无法解析。");
   }
 }
 
 async function fetchGithubUpdateFiles(source) {
-  const files = new Map();
-  await fetchGithubRepositoryFiles(source, "", files);
-  return files;
-}
-
-async function fetchGithubRepositoryFiles(source, directoryPath, files) {
-  const apiUrl =
-    `https://api.github.com/repos/${encodeURIComponent(source.owner)}` +
-    `/${encodeURIComponent(source.repo)}/contents/${encodeGithubPath(directoryPath)}` +
-    `?ref=${encodeURIComponent(source.branch)}`;
-  const response = await fetch(apiUrl);
+  const response = await fetch(githubTarballUrl(source));
   if (!response.ok) {
-    throw new Error(await githubResponseError(response, `读取 GitHub 目录失败：${directoryPath || "/"}`));
+    throw new Error(await githubResponseError(response, "下载 GitHub 更新包失败"));
   }
-
-  const entries = await response.json();
-  if (!Array.isArray(entries)) return;
-
-  for (const entry of entries) {
-    const path = String(entry?.path || "");
-    if (!path || shouldIgnoreUpdatePath(path)) continue;
-
-    if (entry.type === "dir") {
-      await fetchGithubRepositoryFiles(source, path, files);
-      continue;
-    }
-
-    if (entry.type !== "file" || !isUpdatableRepositoryPath(path)) continue;
-    if (entry.download_url) {
-      const rawResponse = await fetch(entry.download_url);
-      if (!rawResponse.ok) {
-        throw new Error(await githubResponseError(rawResponse, `下载 GitHub 文件失败：${path}`));
-      }
-      files.set(path, new Uint8Array(await rawResponse.arrayBuffer()));
-      continue;
-    }
-
-    const bytes = await fetchGithubContentBytes(source, path);
-    if (bytes) files.set(path, bytes);
-  }
-}
-
-async function fetchGithubContentBytes(source, path) {
-  const apiUrl =
-    `https://api.github.com/repos/${encodeURIComponent(source.owner)}` +
-    `/${encodeURIComponent(source.repo)}/contents/${encodeGithubPath(path)}` +
-    `?ref=${encodeURIComponent(source.branch)}`;
-  const response = await fetch(apiUrl);
-  if (response.status === 404) return null;
-  if (!response.ok) throw new Error(await githubResponseError(response, `读取 GitHub 文件失败：${path}`));
-
-  const data = await response.json();
-  if (data?.type !== "file") return null;
-  if (data.encoding === "base64" && typeof data.content === "string") {
-    return base64ToBytes(data.content);
-  }
-  if (data.download_url) {
-    const rawResponse = await fetch(data.download_url);
-    if (!rawResponse.ok) {
-      throw new Error(await githubResponseError(rawResponse, `下载 GitHub 文件失败：${path}`));
-    }
-    return new Uint8Array(await rawResponse.arrayBuffer());
-  }
-  throw new Error(`GitHub 文件无法读取：${path}`);
-}
-
-async function fetchGithubJson(url) {
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(await githubResponseError(response, "读取 GitHub 仓库失败"));
-  return response.json();
+  const compressedBytes = new Uint8Array(await response.arrayBuffer());
+  const archiveBytes = await ungzip(compressedBytes);
+  return parseGithubTarArchive(archiveBytes);
 }
 
 async function githubResponseError(response, fallback) {
@@ -753,6 +685,20 @@ function encodeGithubPath(path) {
     .split("/")
     .map((part) => encodeURIComponent(part))
     .join("/");
+}
+
+function githubRawUrl(source, path) {
+  return (
+    `https://raw.githubusercontent.com/${encodeURIComponent(source.owner)}` +
+    `/${encodeURIComponent(source.repo)}/${encodeGithubPath(source.branch)}/${encodeGithubPath(path)}`
+  );
+}
+
+function githubTarballUrl(source) {
+  return (
+    `https://codeload.github.com/${encodeURIComponent(source.owner)}` +
+    `/${encodeURIComponent(source.repo)}/tar.gz/refs/heads/${encodeGithubPath(source.branch)}`
+  );
 }
 
 async function applyPendingUpdate() {
@@ -916,36 +862,6 @@ function compareVersions(first, second) {
   return 0;
 }
 
-function base64ToBytes(value) {
-  const binary = atob(String(value || "").replace(/\s+/g, ""));
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
-  }
-  return bytes;
-}
-
-function shouldIgnoreUpdatePath(path) {
-  const parts = String(path || "").split("/");
-  return parts.some((part) => IGNORED_UPDATE_DIRECTORIES.has(part));
-}
-
-function isUpdatableRepositoryPath(path) {
-  const normalized = String(path || "").replace(/\\/g, "/");
-  const parts = normalized.split("/");
-  if (!normalized || normalized.startsWith("/") || normalized.endsWith("/")) return false;
-  if (parts.some((part) => !part || part === "." || part === ".." || part.startsWith("."))) {
-    return false;
-  }
-
-  const filename = parts[parts.length - 1] || "";
-  if (filename === "manifest.json") return true;
-
-  const dotIndex = filename.lastIndexOf(".");
-  const extension = dotIndex >= 0 ? filename.slice(dotIndex).toLowerCase() : "";
-  return UPDATE_FILE_EXTENSIONS.has(extension);
-}
-
 function validateUpdateFiles(files) {
   if (!files.size) throw new Error("更新包里没有文件。");
   if (!files.has("manifest.json")) throw new Error("更新包缺少 manifest.json。");
@@ -974,6 +890,76 @@ async function getNestedFileHandle(rootDirectory, path) {
     directory = await directory.getDirectoryHandle(part, { create: true });
   }
   return directory.getFileHandle(filename, { create: true });
+}
+
+async function ungzip(bytes) {
+  if (!globalThis.DecompressionStream) {
+    throw new Error("当前 Chrome 不支持 gzip 解压。");
+  }
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+function parseGithubTarArchive(bytes) {
+  const files = new Map();
+  let offset = 0;
+
+  while (offset + 512 <= bytes.length) {
+    const header = bytes.slice(offset, offset + 512);
+    if (header.every((byte) => byte === 0)) break;
+
+    const name = readTarString(header, 0, 100);
+    const prefix = readTarString(header, 345, 155);
+    const rawPath = prefix ? `${prefix}/${name}` : name;
+    const path = stripTarRootDirectory(rawPath);
+    const sizeText = readTarString(header, 124, 12).trim();
+    const size = parseInt(sizeText || "0", 8);
+    const type = String.fromCharCode(header[156] || 0);
+    offset += 512;
+
+    if ((type === "0" || type === "\0" || type === "") && isUpdatableRepositoryPath(path)) {
+      files.set(path, bytes.slice(offset, offset + size));
+    }
+    offset += Math.ceil(size / 512) * 512;
+  }
+
+  return files;
+}
+
+function stripTarRootDirectory(path) {
+  const parts = String(path || "").split("/").filter(Boolean);
+  parts.shift();
+  return parts.join("/");
+}
+
+function readTarString(bytes, start, length) {
+  let output = "";
+  for (let index = start; index < start + length; index += 1) {
+    const byte = bytes[index];
+    if (!byte) break;
+    output += String.fromCharCode(byte);
+  }
+  return output;
+}
+
+function isUpdatableRepositoryPath(path) {
+  const normalized = String(path || "").replace(/\\/g, "/");
+  const parts = normalized.split("/");
+  if (!normalized || normalized.startsWith("/") || normalized.endsWith("/")) return false;
+  if (
+    parts.some(
+      (part) => !part || part === "." || part === ".." || part.startsWith(".") || IGNORED_UPDATE_DIRECTORIES.has(part)
+    )
+  ) {
+    return false;
+  }
+
+  const filename = parts[parts.length - 1] || "";
+  if (filename === "manifest.json") return true;
+
+  const dotIndex = filename.lastIndexOf(".");
+  const extension = dotIndex >= 0 ? filename.slice(dotIndex).toLowerCase() : "";
+  return UPDATE_FILE_EXTENSIONS.has(extension);
 }
 
 function setUpdateBusy(busy, text = "") {
