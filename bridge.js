@@ -343,6 +343,30 @@
     return textNodes.find((node) => getRawNodeLabel(node) === LIKE_INDEX_NODE_LABEL);
   }
 
+  function findLikeIndexNodes(nodes) {
+    return nodes
+      .filter(isTextLikeNode)
+      .map((node) => ({ node, index: parseLikeIndexText(getRawNodeText(node)) }))
+      .filter((entry) => entry.index);
+  }
+
+  function getOwnerLikeIndexLabel(ownerName) {
+    return `${LIKE_INDEX_NODE_LABEL} - ${ownerName}`;
+  }
+
+  function findOwnerLikeIndexNode(nodes, ownerName) {
+    const ownerLabel = getOwnerLikeIndexLabel(ownerName);
+    const entries = findLikeIndexNodes(nodes);
+    return (
+      entries.find((entry) => getRawNodeLabel(entry.node) === ownerLabel)?.node ||
+      entries.find((entry) => {
+        const owners = normalizeLikeIndex(entry.index).owners;
+        return owners.length === 1 && owners[0].ownerName === ownerName;
+      })?.node ||
+      null
+    );
+  }
+
   function buildSharedLikeText(ownerName, items, color = DEFAULT_LIKE_COLOR, settings = {}) {
     return [
       ownerName,
@@ -366,6 +390,7 @@
     const label = getRawNodeLabel(node);
     if (
       label === LIKE_INDEX_NODE_LABEL ||
+      label.startsWith(`${LIKE_INDEX_NODE_LABEL} - `) ||
       label === SOCIAL_DATA_NODE_LABEL ||
       label.startsWith("Pixmax 更新包")
     ) {
@@ -398,6 +423,31 @@
     };
   }
 
+  function getSharedStateFromLikeIndexNodes(nodes, ownerName) {
+    const ownersByName = new Map();
+    const legacyOwners = [];
+
+    for (const { node, index } of findLikeIndexNodes(nodes)) {
+      const label = getRawNodeLabel(node);
+      const owners = normalizeLikeIndex(index).owners;
+      const isLegacyIndex = label === LIKE_INDEX_NODE_LABEL || owners.length > 1;
+      for (const owner of owners) {
+        if (isLegacyIndex) legacyOwners.push(owner);
+        else ownersByName.set(owner.ownerName, owner);
+      }
+    }
+
+    for (const owner of deriveLikeIndexFromCanvas({ nodes }).owners) {
+      if (!ownersByName.has(owner.ownerName)) ownersByName.set(owner.ownerName, owner);
+    }
+
+    for (const owner of legacyOwners) {
+      if (!ownersByName.has(owner.ownerName)) ownersByName.set(owner.ownerName, owner);
+    }
+
+    return getSharedStateFromLikeIndex({ owners: [...ownersByName.values()] }, ownerName);
+  }
+
   function deriveLikeIndexFromCanvas(canvas) {
     const owners = [];
 
@@ -415,19 +465,20 @@
     return normalizeLikeIndex({ owners });
   }
 
-  function updateLikeIndexOwner(index, ownerName, color, items) {
-    const normalized = normalizeLikeIndex(index);
+  function buildOwnerLikeIndex(ownerName, color, items) {
     const keys = [...new Set((items || []).map(getLikeKey).filter(Boolean))];
-    const owners = normalized.owners.filter((owner) => owner.ownerName !== ownerName);
-    owners.push({
-      color: normalizeColor(color),
-      keys,
-      ownerName
+    return normalizeLikeIndex({
+      owners: [
+        {
+          color: normalizeColor(color),
+          keys,
+          ownerName
+        }
+      ]
     });
-    return normalizeLikeIndex({ owners });
   }
 
-  function buildLikeIndexNode(nodes, data) {
+  function buildLikeIndexNode(nodes, ownerName, data) {
     const positions = nodes
       .filter(isTextLikeNode)
       .map((node) => parseNodeMetaData(node).position || {});
@@ -437,7 +488,7 @@
       uuid: crypto.randomUUID(),
       type: "BASE_TEXT",
       metaData: JSON.stringify({
-        data: { label: LIKE_INDEX_NODE_LABEL },
+        data: { label: getOwnerLikeIndexLabel(ownerName) },
         position: {
           x: maxX + 360,
           y: -520
@@ -454,11 +505,8 @@
   }
 
   async function upsertLikeIndexForOwner(fileUuid, canvas, ownerName, color, items, retryCount = 1) {
-    const indexNode = findLikeIndexNode(canvas.nodes ?? []);
-    const currentIndex = indexNode
-      ? parseLikeIndexText(getRawNodeText(indexNode)) || normalizeLikeIndex()
-      : deriveLikeIndexFromCanvas(canvas);
-    const nextIndex = updateLikeIndexOwner(currentIndex, ownerName, color, items);
+    const indexNode = findOwnerLikeIndexNode(canvas.nodes ?? [], ownerName);
+    const nextIndex = buildOwnerLikeIndex(ownerName, color, items);
     const payload = indexNode
       ? {
           create: [],
@@ -471,7 +519,7 @@
           ]
         }
       : {
-          create: [buildLikeIndexNode(canvas.nodes ?? [], nextIndex)],
+          create: [buildLikeIndexNode(canvas.nodes ?? [], ownerName, nextIndex)],
           update: []
         };
 
@@ -491,40 +539,12 @@
       throw new Error(result.errMessage || result.errCode || "共享 Likes 索引写入失败。");
     }
 
-    return getSharedStateFromLikeIndex(nextIndex, ownerName);
+    const nextCanvas = await fetchCanvas(fileUuid);
+    return getSharedStateFromLikeIndexNodes(nextCanvas.nodes ?? [], ownerName);
   }
 
   function getSharedLikeStateFromCanvas(canvas, ownerName) {
-    const indexNode = findLikeIndexNode(canvas.nodes ?? []);
-    const index = indexNode ? parseLikeIndexText(getRawNodeText(indexNode)) : null;
-    if (index) return getSharedStateFromLikeIndex(index, ownerName);
-
-    const allKeys = [];
-    const ownKeys = [];
-    const colorByKey = {};
-
-    for (const node of canvas.nodes ?? []) {
-      if (!isTextLikeNode(node) || !shouldScanTextNodeForLikes(node)) continue;
-      const parsed = parseSharedLikeStateText(getRawNodeText(node));
-      if (!parsed) continue;
-      const likedBy = parsed.ownerName || getRawNodeLabel(node) || "Unknown";
-
-      for (const item of parsed.items) {
-        if (!item.key) continue;
-        allKeys.push(item.key);
-        if (!colorByKey[item.key]) colorByKey[item.key] = normalizeColor(item.likedByColor || parsed.color);
-        if (likedBy === ownerName) {
-          ownKeys.push(item.key);
-          colorByKey[item.key] = normalizeColor(item.likedByColor || parsed.color);
-        }
-      }
-    }
-
-    return {
-      allKeys,
-      ownKeys,
-      colorByKey
-    };
+    return getSharedStateFromLikeIndexNodes(canvas.nodes ?? [], ownerName);
   }
 
   function getSharedLikesFromCanvas(canvas, ownerName) {

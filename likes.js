@@ -1129,6 +1129,30 @@ function findLikeIndexNode(nodes) {
   return textNodes.find((node) => getRawNodeLabel(node) === LIKE_INDEX_NODE_LABEL);
 }
 
+function findLikeIndexNodes(nodes) {
+  return nodes
+    .filter(isTextLikeNode)
+    .map((node) => ({ node, index: parseLikeIndexText(getRawNodeText(node)) }))
+    .filter((entry) => entry.index);
+}
+
+function getOwnerLikeIndexLabel(ownerName) {
+  return `${LIKE_INDEX_NODE_LABEL} - ${ownerName}`;
+}
+
+function findOwnerLikeIndexNode(nodes, ownerName) {
+  const ownerLabel = getOwnerLikeIndexLabel(ownerName);
+  const entries = findLikeIndexNodes(nodes);
+  return (
+    entries.find((entry) => getRawNodeLabel(entry.node) === ownerLabel)?.node ||
+    entries.find((entry) => {
+      const owners = normalizeLikeIndex(entry.index).owners;
+      return owners.length === 1 && owners[0].ownerName === ownerName;
+    })?.node ||
+    null
+  );
+}
+
 function buildSharedLikeText(ownerName, items, color = DEFAULT_LIKE_COLOR, settings = {}) {
   return [
     ownerName,
@@ -1201,19 +1225,20 @@ function deriveLikeIndexFromCanvas(canvas) {
   return normalizeLikeIndex({ owners });
 }
 
-function updateLikeIndexOwner(index, ownerName, color, items) {
-  const normalized = normalizeLikeIndex(index);
+function buildOwnerLikeIndex(ownerName, color, items) {
   const keys = [...new Set((items || []).map(getLikeKey).filter(Boolean))];
-  const owners = normalized.owners.filter((owner) => owner.ownerName !== ownerName);
-  owners.push({
-    color: normalizeColor(color),
-    keys,
-    ownerName
+  return normalizeLikeIndex({
+    owners: [
+      {
+        color: normalizeColor(color),
+        keys,
+        ownerName
+      }
+    ]
   });
-  return normalizeLikeIndex({ owners });
 }
 
-function buildLikeIndexNode(nodes, data) {
+function buildLikeIndexNode(nodes, ownerName, data) {
   const positions = nodes
     .filter(isTextLikeNode)
     .map((node) => parseNodeMetaData(node).position || {});
@@ -1223,7 +1248,7 @@ function buildLikeIndexNode(nodes, data) {
     uuid: crypto.randomUUID(),
     type: "BASE_TEXT",
     metaData: JSON.stringify({
-      data: { label: LIKE_INDEX_NODE_LABEL },
+      data: { label: getOwnerLikeIndexLabel(ownerName) },
       position: {
         x: maxX + 360,
         y: -520
@@ -1403,11 +1428,8 @@ async function saveSharedOwnItems(items, retryCount = 1) {
 }
 
 async function upsertLikeIndexForOwner(canvas, ownerName, color, items, retryCount = 1) {
-  const indexNode = findLikeIndexNode(canvas.nodes ?? []);
-  const currentIndex = indexNode
-    ? parseLikeIndexText(getRawNodeText(indexNode)) || normalizeLikeIndex()
-    : deriveLikeIndexFromCanvas(canvas);
-  const nextIndex = updateLikeIndexOwner(currentIndex, ownerName, color, items);
+  const indexNode = findOwnerLikeIndexNode(canvas.nodes ?? [], ownerName);
+  const nextIndex = buildOwnerLikeIndex(ownerName, color, items);
   const payload = indexNode
     ? {
         create: [],
@@ -1418,9 +1440,9 @@ async function upsertLikeIndexForOwner(canvas, ownerName, color, items, retryCou
             nodeText: buildLikeIndexText(nextIndex)
           }
         ]
-      }
+    }
     : {
-        create: [buildLikeIndexNode(canvas.nodes ?? [], nextIndex)],
+        create: [buildLikeIndexNode(canvas.nodes ?? [], ownerName, nextIndex)],
         update: []
       };
 
