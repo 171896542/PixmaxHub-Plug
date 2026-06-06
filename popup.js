@@ -37,11 +37,12 @@ const IGNORED_UPDATE_DIRECTORIES = new Set([".git", ".github", "node_modules"]);
 const DEFAULT_OPTIONS = {
   eagleFolderId: "",
   eagleFolderName: "",
-  sharedLikesEnabled: false,
+  sharedLikesEnabled: true,
   sharedLikesCanvasUrl: DEFAULT_DATABASE_URL,
   sharedLikesFileUuid: "",
   sharedLikesOwnerName: "",
   sharedLikesColor: DEFAULT_LIKE_COLOR,
+  liveCollabEnabled: true,
   githubUpdateUrl: DEFAULT_GITHUB_UPDATE_URL
 };
 
@@ -50,6 +51,7 @@ const refreshButton = document.querySelector("#refreshFolders");
 const openLikesButton = document.querySelector("#openLikes");
 const status = document.querySelector("#status");
 const sharedLikesEnabled = document.querySelector("#sharedLikesEnabled");
+const liveCollabEnabled = document.querySelector("#liveCollabEnabled");
 const sharedLikesCanvasUrl = document.querySelector("#sharedLikesCanvasUrl");
 const sharedLikesOwnerName = document.querySelector("#sharedLikesOwnerName");
 const sharedLikesColor = document.querySelector("#sharedLikesColor");
@@ -82,6 +84,7 @@ function init() {
       setStatus("已读取保存的 Eagle 目录。点击刷新可重新选择。", "success");
     }
     sharedLikesEnabled.checked = Boolean(options.sharedLikesEnabled);
+    liveCollabEnabled.checked = Boolean(options.liveCollabEnabled);
     sharedLikesCanvasUrl.value = options.sharedLikesCanvasUrl || "";
     if (!sharedLikesCanvasUrl.value) sharedLikesCanvasUrl.value = DEFAULT_DATABASE_URL;
     sharedLikesOwnerName.value = options.sharedLikesOwnerName || "";
@@ -186,6 +189,7 @@ function saveSharedLikesOptions() {
   const ownerName = sharedLikesOwnerName.value.trim();
   const color = normalizeColor(sharedLikesColor.value);
   const enabled = sharedLikesEnabled.checked;
+  const liveEnabled = liveCollabEnabled.checked;
   const fileUuid = extractFileUuid(canvasUrl);
 
   if (enabled && !fileUuid) {
@@ -193,8 +197,8 @@ function saveSharedLikesOptions() {
     return;
   }
 
-  if (enabled && !ownerName) {
-    setSharedStatus("请填写你的名字，它要和共享画布里的文字节点对应。", "error");
+  if ((enabled || liveEnabled) && !ownerName) {
+    setSharedStatus("请填写你的名字，共享 Likes 和实时协同都会用到它。", "error");
     return;
   }
 
@@ -204,7 +208,8 @@ function saveSharedLikesOptions() {
       sharedLikesCanvasUrl: canvasUrl,
       sharedLikesFileUuid: fileUuid,
       sharedLikesOwnerName: ownerName,
-      sharedLikesColor: color
+      sharedLikesColor: color,
+      liveCollabEnabled: liveEnabled
     },
     () => {
       const runtimeError = chrome.runtime.lastError;
@@ -213,8 +218,14 @@ function saveSharedLikesOptions() {
         return;
       }
 
+      const enabledFeatures = [
+        enabled ? "共享 Likes" : "",
+        liveEnabled ? "实时协同" : ""
+      ].filter(Boolean);
       setSharedStatus(
-        enabled ? `已启用共享 Likes：${ownerName}` : "已关闭共享 Likes，收藏会回到本地保存。",
+        enabledFeatures.length
+          ? `已启用${enabledFeatures.join("、")}：${ownerName}`
+          : "已关闭共享 Likes 和实时协同，收藏会回到本地保存。",
         "success"
       );
       if (enabled) {

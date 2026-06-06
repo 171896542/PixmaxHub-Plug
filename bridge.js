@@ -4,6 +4,240 @@
 
   const REQUEST_EVENT = "pixmax-canvas-cloner:request";
   const RESPONSE_SOURCE = "pixmax-canvas-cloner:bridge";
+  const LIVE_INTERNALS_KEY = "__pixmaxHubLiveInternals";
+
+  function installLiveInternalsProbe() {
+    if (window[LIVE_INTERNALS_KEY]?.installed) return;
+
+    const internals = {
+      installed: true,
+      candidates: [],
+      controllers: [],
+      presenceSockets: [],
+      presenceMessages: [],
+      peerCount: 1,
+      peers: [],
+      mapProbeInteresting: [],
+      mapProbeSetCount: 0
+    };
+    window[LIVE_INTERNALS_KEY] = internals;
+
+    function remember(value, source) {
+      if (!value || typeof value !== "object") return;
+      const hasWorkspaceSync =
+        typeof value.commit === "function" &&
+        typeof value.fetchLastVersion === "function" &&
+        typeof value.applyRemoteSnapshot === "function";
+      if (!hasWorkspaceSync) return;
+      if (!internals.controllers.includes(value)) {
+        internals.controllers.push(value);
+        internals.candidates.push({
+          foundAt: Date.now(),
+          source,
+          keys: Object.getOwnPropertyNames(value).slice(0, 80)
+        });
+      }
+      internals.workspaceController = value;
+    }
+
+    internals.remember = remember;
+
+    function maybeRememberWorkspaceController(value, source) {
+      if (internals.workspaceController) return;
+      if (!value || typeof value !== "object") return;
+      if (
+        value.syncManager &&
+        value.fileTreeStore &&
+        typeof value.commit === "function" &&
+        typeof value.fetchLastVersion === "function" &&
+        typeof value.applyRemoteSnapshot === "function"
+      ) {
+        remember(value, source);
+      }
+    }
+
+    function getStoredLiveIdentity() {
+      try {
+        const parsed = JSON.parse(localStorage.getItem("pixmaxHubLiveIdentity") || "{}");
+        return parsed && typeof parsed === "object" ? parsed : {};
+      } catch {
+        return {};
+      }
+    }
+
+    function normalizeLiveColor(value) {
+      const color = String(value || "").trim();
+      return /^#[0-9a-f]{6}$/i.test(color) ? color.toLowerCase() : "";
+    }
+
+    function applyLiveIdentityToJoinMessage(message) {
+      if (!message || message.type !== "join") return message;
+      const identity = internals.identity || getStoredLiveIdentity();
+      const userName = String(identity.ownerName || "").trim();
+      if (!userName) return message;
+      return {
+        ...message,
+        userName
+      };
+    }
+
+    function emitPresenceMessage(message) {
+      window.postMessage(
+        {
+          source: RESPONSE_SOURCE,
+          notification: "official-presence-message",
+          payload: message
+        },
+        location.origin
+      );
+    }
+
+    function rememberPresenceSocket(socket, url) {
+      if (!socket || socket.__pixmaxHubLivePresenceSocket) return;
+      socket.__pixmaxHubLivePresenceSocket = true;
+      internals.presenceSockets.push({ foundAt: Date.now(), url: String(url || "") });
+
+      const nativeSend = socket.send.bind(socket);
+      socket.send = (value) => {
+        let nextValue = value;
+        try {
+          const message = JSON.parse(String(value));
+          if (message?.type === "join" && String(message.room || "").endsWith(":pixmax-hub-live")) {
+            socket.__pixmaxHubLiveSideRoom = true;
+          }
+          const nextMessage = applyLiveIdentityToJoinMessage(message);
+          if (!socket.__pixmaxHubLiveSideRoom) {
+            internals.presenceSocket = socket;
+            if (nextMessage !== message) {
+              internals.lastJoin = nextMessage;
+              nextValue = JSON.stringify(nextMessage);
+            } else if (message?.type === "join") {
+              internals.lastJoin = message;
+            }
+          }
+          internals.presenceMessages.push({ direction: "out", message: nextMessage, at: Date.now() });
+        } catch {
+          // Keep native payload when it is not JSON.
+        }
+        return nativeSend(nextValue);
+      };
+
+      socket.addEventListener("message", (event) => {
+        try {
+          const message = JSON.parse(String(event.data || ""));
+          internals.presenceMessages.push({ direction: "in", message, at: Date.now() });
+          if (socket.__pixmaxHubLiveSideRoom) return;
+          if (message.type === "joined") {
+            internals.clientId = message.clientId || "";
+            if (Number.isFinite(Number(message.peerCount))) {
+              internals.peerCount = Math.max(1, Number(message.peerCount));
+            }
+          }
+          if (message.type === "room-presence" && Array.isArray(message.peers)) {
+            internals.peers = message.peers;
+            internals.peerCount = Math.max(1, message.peers.length);
+          }
+          emitPresenceMessage(message);
+        } catch {
+          // Ignore malformed presence messages.
+        }
+      });
+    }
+
+    const NativeWebSocket = window.WebSocket;
+    if (NativeWebSocket && !NativeWebSocket.__pixmaxHubLiveProbe) {
+      const PatchedWebSocket = function PatchedWebSocket(url, protocols) {
+        const socket = protocols === undefined
+          ? new NativeWebSocket(url)
+          : new NativeWebSocket(url, protocols);
+        if (String(url || "").includes("/presence/ws")) {
+          rememberPresenceSocket(socket, url);
+        }
+        return socket;
+      };
+      Object.setPrototypeOf(PatchedWebSocket, NativeWebSocket);
+      PatchedWebSocket.prototype = NativeWebSocket.prototype;
+      PatchedWebSocket.CONNECTING = NativeWebSocket.CONNECTING;
+      PatchedWebSocket.OPEN = NativeWebSocket.OPEN;
+      PatchedWebSocket.CLOSING = NativeWebSocket.CLOSING;
+      PatchedWebSocket.CLOSED = NativeWebSocket.CLOSED;
+      PatchedWebSocket.__pixmaxHubLiveProbe = true;
+      window.WebSocket = PatchedWebSocket;
+    }
+
+    internals.setIdentity = (identity = {}) => {
+      internals.identity = {
+        ownerName: String(identity.ownerName || "").trim(),
+        color: normalizeLiveColor(identity.color)
+      };
+      try {
+        localStorage.setItem("pixmaxHubLiveIdentity", JSON.stringify(internals.identity));
+      } catch {
+        // Ignore localStorage failures.
+      }
+      const socket = internals.presenceSocket;
+      const join = internals.lastJoin;
+      if (socket?.readyState === 1 && join?.room && join?.userId) {
+        socket.send(
+          JSON.stringify(
+            applyLiveIdentityToJoinMessage({
+              ...join,
+              type: "join"
+            })
+          )
+        );
+      }
+    };
+
+    internals.broadcastPresence = (payload) => {
+      const socket = internals.presenceSocket;
+      if (!socket || socket.readyState !== 1) return false;
+      socket.send(JSON.stringify({ type: "broadcast", payload }));
+      return true;
+    };
+
+    const nativeMapSet = Map.prototype.set;
+    if (nativeMapSet && !nativeMapSet.__pixmaxHubLiveTargetedProbe) {
+      let restored = false;
+      const restoreMapSet = () => {
+        if (restored) return;
+        restored = true;
+        if (Map.prototype.set === patchedMapSet) Map.prototype.set = nativeMapSet;
+      };
+      const patchedMapSet = function pixmaxHubLiveTargetedMapSet(key, value) {
+        const result = nativeMapSet.call(this, key, value);
+        try {
+          internals.mapProbeSetCount += 1;
+          if (
+            value &&
+            typeof value === "object" &&
+            (value.syncManager || value.fileTreeStore || typeof value.commit === "function")
+          ) {
+            internals.mapProbeInteresting.push({
+              at: Date.now(),
+              hasCommit: typeof value.commit === "function",
+              hasFileTreeStore: Boolean(value.fileTreeStore),
+              hasSyncManager: Boolean(value.syncManager),
+              keys: Object.getOwnPropertyNames(value).slice(0, 40),
+              source: "map:set"
+            });
+            if (internals.mapProbeInteresting.length > 20) internals.mapProbeInteresting.shift();
+          }
+          maybeRememberWorkspaceController(value, "svelte-context-map");
+          if (internals.workspaceController) restoreMapSet();
+        } catch {
+          // Keep Map.set transparent.
+        }
+        return result;
+      };
+      patchedMapSet.__pixmaxHubLiveTargetedProbe = true;
+      Map.prototype.set = patchedMapSet;
+      window.setTimeout(restoreMapSet, 15000);
+    }
+  }
+
+  installLiveInternalsProbe();
+
   const NODE_SELECTOR = ".svelte-flow__node[data-id]";
   const EDGE_SELECTOR = ".svelte-flow__edge[aria-label]";
   const API_PREFIX = "/user/api";
@@ -87,6 +321,123 @@
 
   async function fetchCurrentCanvas() {
     return fetchCanvas();
+  }
+
+  async function getCurrentCanvasRevision() {
+    const canvas = await fetchCurrentCanvas();
+    return {
+      nodeCount: Array.isArray(canvas.nodes) ? canvas.nodes.length : 0,
+      revision: canvas.revision ?? null
+    };
+  }
+
+  function getOfficialWorkspaceController() {
+    const internals = window[LIVE_INTERNALS_KEY];
+    const controller = internals?.workspaceController;
+    if (
+      controller &&
+      typeof controller.commit === "function" &&
+      typeof controller.fetchLastVersion === "function" &&
+      typeof controller.applyRemoteSnapshot === "function"
+    ) {
+      return controller;
+    }
+    return null;
+  }
+
+  function getOfficialLiveSyncStatus() {
+    const internals = window[LIVE_INTERNALS_KEY];
+    const controller = getOfficialWorkspaceController();
+    return {
+      available: Boolean(controller),
+      candidateCount: internals?.controllers?.length || 0,
+      candidates: internals?.candidates || [],
+      currentRevision: controller?.currentRevision ?? null,
+      fileUuid: controller?.fileTreeStore?.activeFileId || getCanvasIdentity().fileUuid || "",
+      mapProbeInteresting: internals?.mapProbeInteresting || [],
+      mapProbeSetCount: internals?.mapProbeSetCount || 0,
+      phase: controller?.phase || ""
+    };
+  }
+
+  function setLivePresenceIdentity(payload = {}) {
+    const internals = window[LIVE_INTERNALS_KEY];
+    internals?.setIdentity?.({
+      color: payload.color,
+      ownerName: payload.ownerName
+    });
+    return getOfficialPresenceStatus();
+  }
+
+  function broadcastOfficialPresence(payload = {}) {
+    const internals = window[LIVE_INTERNALS_KEY];
+    return {
+      sent: Boolean(internals?.broadcastPresence?.(payload)),
+      status: getOfficialPresenceStatus()
+    };
+  }
+
+  function getOfficialPresenceStatus() {
+    const internals = window[LIVE_INTERNALS_KEY];
+    const socket = internals?.presenceSocket;
+    return {
+      available: Boolean(socket),
+      clientId: internals?.clientId || "",
+      identity: internals?.identity || null,
+      lastJoin: internals?.lastJoin || null,
+      peerCount: internals?.peerCount || 1,
+      peers: internals?.peers || [],
+      readyState: socket?.readyState ?? null,
+      socketCount: internals?.presenceSockets?.length || 0
+    };
+  }
+
+  async function triggerOfficialWorkspaceSync(payload = {}) {
+    const controller = getOfficialWorkspaceController();
+    if (!controller) {
+      return {
+        available: false,
+        fallback: await triggerOfficialSync()
+      };
+    }
+    const beforeRevision = controller.currentRevision ?? null;
+    await controller.commit(payload.reason || "pixmax-hub-live");
+    return {
+      available: true,
+      beforeRevision,
+      revision: controller.currentRevision ?? null
+    };
+  }
+
+  async function pullOfficialRemoteSnapshot(payload = {}) {
+    const controller = getOfficialWorkspaceController();
+    if (!controller) {
+      return {
+        available: false
+      };
+    }
+
+    const fileUuid =
+      payload.fileUuid ||
+      controller.fileTreeStore?.activeFileId ||
+      getCanvasIdentity().fileUuid;
+    if (!fileUuid) throw new Error("当前网址缺少画布 file 参数。");
+
+    const remote = await controller.fetchLastVersion(fileUuid);
+    if (remote?.revision == null || !remote.snapshot) {
+      throw new Error("瑞云官方拉取没有返回有效版本。");
+    }
+    const beforeRevision = controller.currentRevision ?? null;
+    const shouldApply = remote.revision !== beforeRevision;
+    if (shouldApply) {
+      controller.applyRemoteSnapshot(remote.snapshot, remote.revision);
+    }
+    return {
+      applied: shouldApply,
+      available: true,
+      beforeRevision,
+      revision: remote.revision
+    };
   }
 
   function resolveAssetUrl(asset) {
@@ -957,6 +1308,11 @@
     document.dispatchEvent(new KeyboardEvent("keyup", init));
   }
 
+  function triggerOfficialSync() {
+    dispatchShortcut("s");
+    return { triggered: true };
+  }
+
   function rewriteMentionTokens(value, nodeIdMap) {
     let rewrittenMentionCount = 0;
 
@@ -1159,6 +1515,46 @@
 
       if (action === "prepare-paste-repair") {
         respond(requestId, true, prepareNativePasteWithMentionRepair());
+        return;
+      }
+
+      if (action === "get-current-canvas-revision") {
+        respond(requestId, true, await getCurrentCanvasRevision());
+        return;
+      }
+
+      if (action === "get-official-live-sync-status") {
+        respond(requestId, true, getOfficialLiveSyncStatus());
+        return;
+      }
+
+      if (action === "get-official-presence-status") {
+        respond(requestId, true, getOfficialPresenceStatus());
+        return;
+      }
+
+      if (action === "set-live-presence-identity") {
+        respond(requestId, true, setLivePresenceIdentity(payload));
+        return;
+      }
+
+      if (action === "broadcast-official-presence") {
+        respond(requestId, true, broadcastOfficialPresence(payload));
+        return;
+      }
+
+      if (action === "trigger-official-workspace-sync") {
+        respond(requestId, true, await triggerOfficialWorkspaceSync(payload));
+        return;
+      }
+
+      if (action === "pull-official-remote-snapshot") {
+        respond(requestId, true, await pullOfficialRemoteSnapshot(payload));
+        return;
+      }
+
+      if (action === "trigger-official-sync") {
+        respond(requestId, true, triggerOfficialSync());
         return;
       }
 

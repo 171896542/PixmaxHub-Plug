@@ -12,18 +12,28 @@
   const ACTIONS_CLASS = "pixmax-canvas-cloner-actions";
   const CONTEXT_PASTE_CLASS = "pixmax-canvas-cloner-context-paste";
   const STYLE_ID = "pixmax-canvas-cloner-style";
-  const STYLE_VERSION = "1.2.10";
+  const STYLE_VERSION = "1.3.9";
   const TOAST_ID = "pixmax-canvas-cloner-toast";
+  const LIVE_TOGGLE_ID = "pixmax-canvas-cloner-live-toggle";
+  const LIVE_CURSOR_LAYER_ID = "pixmax-canvas-cloner-live-cursors";
   const LIKES_STORAGE_KEY = "pixmaxLikedItems";
   const UPDATE_CHECK_STORAGE_KEY = "pixmaxHubUpdateReminder";
   const DEFAULT_GITHUB_UPDATE_URL = "https://github.com/171896542/PixmaxHub-Plug/tree/main";
   const UPDATE_REMINDER_INTERVAL_MS = 6 * 60 * 60 * 1000;
   const DEFAULT_LIKE_COLOR = "#ff3864";
+  const LIVE_CURSOR_SEND_INTERVAL_MS = 45;
+  const LIVE_REMOTE_CURSOR_TTL_MS = 2600;
+  const LIVE_REVISION_POLL_INTERVAL_MS = 300;
+  const LIVE_SYNC_TRIGGER_INTERVAL_MS = 120;
+  const LIVE_REVISION_CHECK_DELAY_MS = 180;
+  const LIVE_REMOTE_BROADCAST_PULL_DELAY_MS = 20;
+  const LIVE_REMOTE_ACTIVITY_GRACE_MS = 2500;
   const SHARED_OPTIONS_DEFAULTS = {
-    sharedLikesEnabled: false,
+    sharedLikesEnabled: true,
     sharedLikesFileUuid: "",
     sharedLikesOwnerName: "",
-    sharedLikesColor: DEFAULT_LIKE_COLOR
+    sharedLikesColor: DEFAULT_LIKE_COLOR,
+    liveCollabEnabled: true
   };
   const requests = new Map();
   const extensionRequests = new Map();
@@ -36,6 +46,35 @@
   let legacyCleanupScheduled = false;
   let toastTimer = 0;
   let lastContextMenuPoint = null;
+  let liveReconnectTimer = 0;
+  let liveRevisionTimer = 0;
+  let liveCursorCleanupTimer = 0;
+  let liveSyncTriggerTimer = 0;
+  let liveSocket = null;
+  let liveSocketReconnectAttempt = 0;
+  let liveSocketStatus = "idle";
+  let liveSocketLastError = "";
+  let liveSocketLastOpenAt = 0;
+  let liveSocketLastMessageAt = 0;
+  let liveSocketLastSentAt = 0;
+  let liveLastCursorSentAt = 0;
+  let liveLastSyncTriggeredAt = 0;
+  let liveLastLocalActivityAt = 0;
+  let liveRemoteActivityUntil = 0;
+  let liveLastKnownRevision = null;
+  let liveSyncInFlight = false;
+  let liveSyncQueued = false;
+  let liveOptions = null;
+  let liveOfficialSyncAvailable = false;
+  let liveOfficialSyncWarned = false;
+  let livePresencePeerCount = 1;
+  let liveDomPeerCount = 1;
+  let liveMultiUserSyncNotified = false;
+  let liveConnectionKey = "";
+  let liveSessionId = "";
+  let livePresenceAppearanceScheduled = false;
+  const livePendingNodeIds = new Set();
+  const liveRemoteCursors = new Map();
 
   function createRequestId() {
     return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -79,6 +118,11 @@
       return;
     }
 
+    if (event.data.notification === "official-presence-message") {
+      handleLiveSocketMessage(JSON.stringify(event.data.payload || {}));
+      return;
+    }
+
     const pending = requests.get(event.data.requestId);
     if (!pending) return;
 
@@ -86,6 +130,32 @@
     requests.delete(event.data.requestId);
     if (event.data.ok) pending.resolve(event.data.payload);
     else pending.reject(new Error(event.data.payload?.error ?? "操作失败。"));
+  });
+
+  window.addEventListener("pixmax-canvas-cloner:live-debug", () => {
+    window.dispatchEvent(
+      new CustomEvent("pixmax-canvas-cloner:live-debug-response", {
+        detail: JSON.stringify({
+          enabled: Boolean(liveOptions?.enabled),
+          fileUuid: liveOptions?.fileUuid || "",
+          ownerName: liveOptions?.ownerName || "",
+          connectionKey: liveConnectionKey,
+          sessionId: liveSessionId,
+          socketReadyState: liveSocket?.readyState ?? null,
+          socketStatus: liveSocketStatus,
+          socketLastError: liveSocketLastError,
+          socketLastOpenAt: liveSocketLastOpenAt,
+          socketLastMessageAt: liveSocketLastMessageAt,
+          socketLastSentAt: liveSocketLastSentAt,
+          sideRoom: getLiveSideRoom(),
+          remoteCursorCount: liveRemoteCursors.size,
+          remoteActivityUntil: liveRemoteActivityUntil,
+          peerCount: livePresencePeerCount,
+          domPeerCount: liveDomPeerCount,
+          officialSyncAvailable: liveOfficialSyncAvailable
+        })
+      })
+    );
   });
 
   window.addEventListener(EXTENSION_RESPONSE_EVENT, (event) => {
@@ -204,6 +274,81 @@
         border-color: #f8d66d;
         background: #211c10f5;
         color: #f8d66d;
+      }
+      #${LIVE_TOGGLE_ID} {
+        position: fixed;
+        right: 22px;
+        bottom: 74px;
+        z-index: 2147483646;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        height: 34px;
+        border: 1px solid #3f4248;
+        border-radius: 8px;
+        padding: 0 10px;
+        background: #141416f2;
+        color: #a9adb5;
+        box-shadow: 0 10px 30px #0006;
+        cursor: pointer;
+        font: 12px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      #${LIVE_TOGGLE_ID}[data-active="true"] {
+        border-color: #75e9f4;
+        color: #75e9f4;
+      }
+      #${LIVE_TOGGLE_ID}::before {
+        content: "";
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: #777;
+      }
+      #${LIVE_TOGGLE_ID}[data-active="true"]::before {
+        background: #75e9f4;
+        box-shadow: 0 0 0 4px rgb(117 233 244 / 18%);
+      }
+      #${LIVE_CURSOR_LAYER_ID} {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483645;
+        pointer-events: none;
+      }
+      .pixmax-canvas-cloner-live-cursor {
+        position: absolute;
+        left: 0;
+        top: 0;
+        display: flex;
+        align-items: flex-start;
+        gap: 4px;
+        opacity: 1;
+        transform: translate3d(var(--pixmax-live-x, -9999px), var(--pixmax-live-y, -9999px), 0);
+        transition: transform 70ms linear, opacity 180ms ease;
+        will-change: transform, opacity;
+      }
+      .pixmax-canvas-cloner-live-cursor[data-stale="true"] {
+        opacity: 0;
+      }
+      .pixmax-canvas-cloner-live-cursor-icon {
+        width: 0;
+        height: 0;
+        border-top: 15px solid var(--pixmax-live-color, #75e9f4);
+        border-right: 10px solid transparent;
+        filter: drop-shadow(0 2px 5px rgb(0 0 0 / 65%));
+      }
+      .pixmax-canvas-cloner-live-cursor-name {
+        margin-top: 10px;
+        max-width: 160px;
+        border: 1px solid rgb(255 255 255 / 20%);
+        border-radius: 7px;
+        padding: 4px 7px;
+        background: color-mix(in srgb, var(--pixmax-live-color, #75e9f4) 22%, #111 78%);
+        color: #fff;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        box-shadow: 0 6px 16px rgb(0 0 0 / 45%);
+        font: 12px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       }
     `;
     document.head.appendChild(style);
@@ -354,6 +499,22 @@
     });
   }
 
+  function syncStorageSet(values) {
+    return new Promise((resolve, reject) => {
+      const storage = getSyncStorageArea();
+      if (!storage) {
+        reject(new Error("Extension sync storage is unavailable. Refresh Pixmax and try again."));
+        return;
+      }
+
+      storage.set(values, () => {
+        const runtimeError = globalThis.chrome?.runtime?.lastError;
+        if (runtimeError) reject(new Error(runtimeError.message));
+        else resolve();
+      });
+    });
+  }
+
   async function getSharedLikeOptions() {
     const options = await syncStorageGet(SHARED_OPTIONS_DEFAULTS);
     const fileUuid = String(options.sharedLikesFileUuid || "").trim();
@@ -364,6 +525,735 @@
       fileUuid,
       ownerName
     };
+  }
+
+  function getCurrentFileUuid() {
+    try {
+      return new URL(location.href).searchParams.get("file") || "";
+    } catch {
+      return "";
+    }
+  }
+
+  function getLiveUserId(ownerName) {
+    if (liveSessionId) return liveSessionId;
+    try {
+      liveSessionId = `pixmax-hub-tab-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      return liveSessionId;
+    } catch {
+      liveSessionId = `pixmax-hub-${ownerName || "user"}-${Math.random().toString(36).slice(2)}`;
+      return liveSessionId;
+    }
+  }
+
+  function getLiveSocketUrl() {
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    return `${protocol}//${location.host}/presence/ws`;
+  }
+
+  function getLiveSideRoom() {
+    return liveOptions?.fileUuid ? `${liveOptions.fileUuid}:pixmax-hub-live` : "";
+  }
+
+  async function getLiveCollabOptions() {
+    const options = await syncStorageGet(SHARED_OPTIONS_DEFAULTS);
+    const fileUuid = getCurrentFileUuid();
+    const ownerName = String(options.sharedLikesOwnerName || "").trim();
+    return {
+      color: normalizeColor(options.sharedLikesColor),
+      enabled: Boolean(options.liveCollabEnabled && fileUuid && ownerName),
+      fileUuid,
+      ownerName,
+      rawEnabled: Boolean(options.liveCollabEnabled)
+    };
+  }
+
+  function ensureLiveToggle() {
+    let button = document.getElementById(LIVE_TOGGLE_ID);
+    if (button) return button;
+
+    button = document.createElement("button");
+    button.id = LIVE_TOGGLE_ID;
+    button.type = "button";
+    button.title = "开启后显示协同鼠标，并自动监听云端版本变化。名字和颜色在扩展弹窗里设置。";
+    button.addEventListener("click", toggleLiveCollabFromPage);
+    document.body.appendChild(button);
+    return button;
+  }
+
+  function updateLiveToggle() {
+    const button = ensureLiveToggle();
+    const active = Boolean(liveOptions?.enabled);
+    button.dataset.active = active ? "true" : "false";
+    const waitingForPeer = active && !hasConfirmedLiveRemotePeer();
+    button.textContent = active
+      ? waitingForPeer
+        ? "实时协同 等待成员"
+        : "实时协同 开"
+      : "实时协同 关";
+    scheduleOfficialPresenceAppearance();
+  }
+
+  async function toggleLiveCollabFromPage() {
+    try {
+      const nextEnabled = !Boolean(liveOptions?.rawEnabled);
+      const options = await syncStorageGet(SHARED_OPTIONS_DEFAULTS);
+      const ownerName = String(options.sharedLikesOwnerName || "").trim();
+      if (nextEnabled && !ownerName) {
+        showToast("请先在扩展弹窗里填写我的名字，再开启实时协同。", true);
+        return;
+      }
+      await syncStorageSet({ liveCollabEnabled: nextEnabled });
+      showToast(nextEnabled ? "实时协同已开启。" : "实时协同已关闭。");
+      await syncLiveCollabState();
+    } catch (error) {
+      showToast(error.message || String(error), true);
+    }
+  }
+
+  async function syncLiveCollabState() {
+    try {
+      liveOptions = await getLiveCollabOptions();
+      updateLiveToggle();
+      if (liveOptions.enabled) {
+        refreshOfficialLiveSyncStatus();
+        startLiveCollab();
+      }
+      else stopLiveCollab();
+    } catch (error) {
+      stopLiveCollab();
+      showToast(error.message || String(error), true);
+    }
+  }
+
+  function startLiveCollab() {
+    if (!liveOptions?.enabled) return;
+    const nextConnectionKey = `${liveOptions.fileUuid}:${liveOptions.ownerName}:${liveOptions.color}`;
+    if (liveConnectionKey && liveConnectionKey !== nextConnectionKey) {
+      closeLiveSocket();
+      liveLastKnownRevision = null;
+    }
+    liveConnectionKey = nextConnectionKey;
+    liveSessionId = getLiveUserId(liveOptions.ownerName);
+    ensureLiveCursorLayer();
+    connectLiveSocket();
+    document.addEventListener("pointermove", handleLivePointerMove, true);
+    document.addEventListener("pointerleave", handleLivePointerLeave, true);
+    document.addEventListener("pointerup", handleLiveLocalActivity, true);
+    document.addEventListener("change", handleLiveLocalActivity, true);
+    document.addEventListener("input", handleLiveLocalActivity, true);
+    configureOfficialPresence();
+    startLiveRevisionPolling();
+    startLiveCursorCleanup();
+  }
+
+  function stopLiveCollab() {
+    document.removeEventListener("pointermove", handleLivePointerMove, true);
+    document.removeEventListener("pointerleave", handleLivePointerLeave, true);
+    document.removeEventListener("pointerup", handleLiveLocalActivity, true);
+    document.removeEventListener("change", handleLiveLocalActivity, true);
+    document.removeEventListener("input", handleLiveLocalActivity, true);
+    window.clearTimeout(liveReconnectTimer);
+    window.clearTimeout(liveSyncTriggerTimer);
+    window.clearInterval(liveRevisionTimer);
+    window.clearInterval(liveCursorCleanupTimer);
+    liveRevisionTimer = 0;
+    liveCursorCleanupTimer = 0;
+    liveConnectionKey = "";
+    liveLastKnownRevision = null;
+    liveSyncInFlight = false;
+    liveSyncQueued = false;
+    liveRemoteActivityUntil = 0;
+    livePresencePeerCount = 1;
+    liveDomPeerCount = 1;
+    liveMultiUserSyncNotified = false;
+    liveOfficialSyncAvailable = false;
+    liveOfficialSyncWarned = false;
+    livePendingNodeIds.clear();
+    clearLiveRemoteCursors();
+    updateLiveToggle();
+  }
+
+  function connectLiveSocket() {
+    if (!liveOptions?.enabled) return;
+    if (liveSocket?.readyState === WebSocket.OPEN || liveSocket?.readyState === WebSocket.CONNECTING) return;
+    const room = getLiveSideRoom();
+    if (!room) return;
+
+    closeLiveSocket({ reconnect: false });
+    let socket;
+    try {
+      liveSocketStatus = "connecting";
+      liveSocketLastError = "";
+      socket = new WebSocket(getLiveSocketUrl());
+    } catch {
+      liveSocketStatus = "connect-error";
+      liveSocketLastError = "constructor";
+      scheduleLiveSocketReconnect();
+      return;
+    }
+
+    liveSocket = socket;
+    socket.addEventListener("open", () => {
+      liveSocketStatus = "open";
+      liveSocketLastOpenAt = Date.now();
+      liveSocketReconnectAttempt = 0;
+      socket.send(
+        JSON.stringify({
+          type: "join",
+          room,
+          userId: liveSessionId,
+          userName: liveOptions.ownerName
+        })
+      );
+    });
+    socket.addEventListener("message", (event) => {
+      liveSocketLastMessageAt = Date.now();
+      handleLiveSocketMessage(String(event.data || ""));
+    });
+    socket.addEventListener("close", () => {
+      if (liveSocket === socket) liveSocket = null;
+      liveSocketStatus = "closed";
+      if (!socket.__pixmaxHubLiveClosing) scheduleLiveSocketReconnect();
+    });
+    socket.addEventListener("error", () => {
+      liveSocketStatus = "error";
+      liveSocketLastError = "socket-error";
+      if (!socket.__pixmaxHubLiveClosing) scheduleLiveSocketReconnect();
+    });
+  }
+
+  function scheduleLiveSocketReconnect() {
+    if (!liveOptions?.enabled) return;
+    window.clearTimeout(liveReconnectTimer);
+    const delay = Math.min(3000, 500 + liveSocketReconnectAttempt * 350);
+    liveSocketReconnectAttempt += 1;
+    liveReconnectTimer = window.setTimeout(() => {
+      connectLiveSocket();
+    }, delay);
+  }
+
+  function closeLiveSocket(options = {}) {
+    window.clearTimeout(liveReconnectTimer);
+    if (options.reconnect === false) {
+      liveReconnectTimer = 0;
+    }
+    const socket = liveSocket;
+    liveSocket = null;
+    if (!socket) return;
+    socket.__pixmaxHubLiveClosing = true;
+    socket.onopen = null;
+    socket.onmessage = null;
+    socket.onclose = null;
+    socket.onerror = null;
+    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+      socket.close();
+    }
+  }
+
+  async function configureOfficialPresence() {
+    if (!liveOptions?.enabled) return;
+    liveSessionId = getLiveUserId(liveOptions.ownerName);
+    try {
+      const status = await requestBridge(
+        "set-live-presence-identity",
+        {
+          color: liveOptions.color,
+          ownerName: liveOptions.ownerName
+        },
+        4000
+      );
+      updateLivePresenceStatus(status);
+      if (!status?.available && !liveOfficialSyncWarned) {
+        liveOfficialSyncWarned = true;
+        showToast("需要刷新 Pixmax 页面，才能把官方在线用户改成你的名字和颜色。", true, {
+          duration: 5200
+        });
+      }
+      scheduleOfficialPresenceAppearance();
+    } catch {
+      // Presence identity is cosmetic; keep live sync running.
+    }
+  }
+
+  function broadcastLivePayload(payload) {
+    const finalPayload = {
+      ...payload,
+      fileUuid: liveOptions?.fileUuid || "",
+      senderId: liveSessionId,
+      sentAt: Date.now()
+    };
+    if (liveSocket?.readyState === WebSocket.OPEN) {
+      liveSocket.send(JSON.stringify({ type: "broadcast", payload: finalPayload }));
+      liveSocketLastSentAt = Date.now();
+    } else {
+      connectLiveSocket();
+    }
+    return requestBridge(
+      "broadcast-official-presence",
+      finalPayload,
+      2500
+    ).catch(() => null);
+  }
+
+  function handleLiveSocketMessage(value) {
+    let message;
+    try {
+      message = JSON.parse(String(value || ""));
+    } catch {
+      return;
+    }
+
+    updateLivePresenceStatus(message);
+
+    const payload = message.payload && typeof message.payload === "object"
+      ? message.payload
+      : message.type === "broadcast" && message.data && typeof message.data === "object"
+        ? message.data
+        : null;
+    if (!payload || payload.senderId === liveSessionId || payload.fileUuid !== liveOptions?.fileUuid) {
+      return;
+    }
+
+    markLiveRemoteActivity();
+
+    if (payload.kind === "pixmax-live-cursor") {
+      renderRemoteLiveCursor(payload);
+      return;
+    }
+
+    if (payload.kind === "pixmax-live-cursor-hide") {
+      hideRemoteLiveCursor(payload.senderId);
+      return;
+    }
+
+    if (payload.kind === "pixmax-live-revision") {
+      scheduleLiveRevisionCheck("remote-broadcast", payload.revision);
+      return;
+    }
+  }
+
+  function updateLivePresenceStatus(status = {}) {
+    const nextPeerCount = Number.isFinite(Number(status.peerCount))
+      ? Math.max(1, Number(status.peerCount))
+      : Array.isArray(status.peers)
+        ? Math.max(1, status.peers.length)
+        : livePresencePeerCount;
+    const hadRemotePeer = hasLiveRemotePeer();
+    livePresencePeerCount = nextPeerCount;
+    const hasRemotePeer = hasLiveRemotePeer();
+    updateLiveToggle();
+    if (hasRemotePeer && !hadRemotePeer) {
+      liveMultiUserSyncNotified = true;
+      if (liveSyncQueued || Date.now() - liveLastLocalActivityAt < 15000) {
+        scheduleLiveOfficialSync();
+      }
+      scheduleLiveRevisionCheck("peer-joined");
+    }
+  }
+
+  function hasLiveRemotePeer() {
+    return (
+      hasConfirmedLiveRemotePeer() ||
+      Date.now() < liveRemoteActivityUntil ||
+      liveRemoteCursors.size > 0
+    );
+  }
+
+  function hasConfirmedLiveRemotePeer() {
+    return (
+      livePresencePeerCount >= 2 ||
+      hasCollaborationConflictDialog()
+    );
+  }
+
+  function markLiveRemoteActivity() {
+    const hadRemotePeer = hasLiveRemotePeer();
+    liveRemoteActivityUntil = Date.now() + LIVE_REMOTE_ACTIVITY_GRACE_MS;
+    if (livePresencePeerCount < 2) livePresencePeerCount = 2;
+    updateLiveToggle();
+    if (!hadRemotePeer && (liveSyncQueued || Date.now() - liveLastLocalActivityAt < 15000)) {
+      scheduleLiveOfficialSync();
+    }
+  }
+
+  function getFlowTransform() {
+    const pane = document.querySelector(".svelte-flow__pane") || document.querySelector(".svelte-flow");
+    const viewport = document.querySelector(".svelte-flow__viewport");
+    if (!pane || !viewport || !window.DOMMatrix) return null;
+
+    const paneRect = pane.getBoundingClientRect();
+    const transform = getComputedStyle(viewport).transform;
+    const matrix = transform && transform !== "none" ? new DOMMatrix(transform) : new DOMMatrix();
+    const scale = matrix.a || 1;
+    return { matrix, paneRect, scale };
+  }
+
+  function screenToFlowPoint(clientX, clientY) {
+    const transform = getFlowTransform();
+    if (!transform) return null;
+    return {
+      x: (clientX - transform.paneRect.left - transform.matrix.e) / transform.scale,
+      y: (clientY - transform.paneRect.top - transform.matrix.f) / transform.scale
+    };
+  }
+
+  function flowToScreenPoint(x, y) {
+    const transform = getFlowTransform();
+    if (!transform) return null;
+    return {
+      x: transform.paneRect.left + transform.matrix.e + x * transform.scale,
+      y: transform.paneRect.top + transform.matrix.f + y * transform.scale
+    };
+  }
+
+  function handleLivePointerMove(event) {
+    if (!liveOptions?.enabled || event.pointerType === "touch") return;
+    if (event.buttons && event.target?.closest?.(".svelte-flow")) {
+      markLiveDirtyNodes(event.target);
+      scheduleLiveOfficialSync();
+      scheduleLiveRevisionCheck("drag");
+    }
+    const now = Date.now();
+    if (now - liveLastCursorSentAt < LIVE_CURSOR_SEND_INTERVAL_MS) return;
+    const point = screenToFlowPoint(event.clientX, event.clientY);
+    if (!point) return;
+
+    liveLastCursorSentAt = now;
+    broadcastLivePayload({
+      kind: "pixmax-live-cursor",
+      color: liveOptions.color,
+      ownerName: liveOptions.ownerName,
+      x: Math.round(point.x * 10) / 10,
+      y: Math.round(point.y * 10) / 10
+    });
+  }
+
+  function handleLivePointerLeave() {
+    if (!liveOptions?.enabled) return;
+    broadcastLivePayload({
+      kind: "pixmax-live-cursor-hide",
+      ownerName: liveOptions.ownerName
+    });
+  }
+
+  function handleLiveLocalActivity() {
+    if (!liveOptions?.enabled) return;
+    liveLastLocalActivityAt = Date.now();
+    scheduleLiveOfficialSync();
+    scheduleLiveRevisionCheck("local-activity");
+  }
+
+  async function refreshOfficialLiveSyncStatus() {
+    try {
+      const status = await requestBridge("get-official-live-sync-status", {}, 4000);
+      liveOfficialSyncAvailable = Boolean(status?.available);
+      if (!liveOfficialSyncAvailable && !liveOfficialSyncWarned) {
+        liveOfficialSyncWarned = true;
+        showToast("实时协同需要刷新 Pixmax 页面后捕获瑞云官方同步入口。", true, {
+          duration: 5200
+        });
+      }
+    } catch {
+      liveOfficialSyncAvailable = false;
+    }
+  }
+
+  function markLiveDirtyNodes(target) {
+    liveLastLocalActivityAt = Date.now();
+    const node = target?.closest?.(NODE_SELECTOR);
+    if (node?.dataset.id) livePendingNodeIds.add(node.dataset.id);
+    for (const selectedNode of document.querySelectorAll(`${NODE_SELECTOR}.selected`)) {
+      if (selectedNode.dataset.id) livePendingNodeIds.add(selectedNode.dataset.id);
+    }
+  }
+
+  function scheduleLiveOfficialSync() {
+    if (!hasLiveRemotePeer()) {
+      liveSyncQueued = true;
+      window.clearTimeout(liveSyncTriggerTimer);
+      return;
+    }
+    const now = Date.now();
+    const delay = Math.max(0, LIVE_SYNC_TRIGGER_INTERVAL_MS - (now - liveLastSyncTriggeredAt));
+    window.clearTimeout(liveSyncTriggerTimer);
+    liveSyncTriggerTimer = window.setTimeout(() => {
+      if (liveSyncInFlight) {
+        liveSyncQueued = true;
+        return;
+      }
+      liveSyncInFlight = true;
+      liveSyncQueued = false;
+      liveLastSyncTriggeredAt = Date.now();
+      livePendingNodeIds.clear();
+      requestBridge(
+        "trigger-official-workspace-sync",
+        { reason: "pixmax-hub-live" },
+        12000
+      )
+        .then((result) => {
+          liveOfficialSyncAvailable = Boolean(result?.available);
+          if (!liveOfficialSyncAvailable && !liveOfficialSyncWarned) {
+            liveOfficialSyncWarned = true;
+            showToast("没有捕获到瑞云官方同步入口，请刷新 Pixmax 页面后再试。", true, {
+              duration: 5200
+            });
+          }
+          if (result?.revision) {
+            liveLastKnownRevision = result.revision;
+            broadcastLiveRevision("official-sync", result.revision);
+          }
+        })
+        .then(() => scheduleLiveRevisionCheck("official-sync"))
+        .catch(() => {})
+        .finally(() => {
+          liveSyncInFlight = false;
+          if (liveSyncQueued || liveLastLocalActivityAt > liveLastSyncTriggeredAt) {
+            liveSyncQueued = false;
+            scheduleLiveOfficialSync();
+          }
+        });
+    }, delay);
+  }
+
+  function ensureLiveCursorLayer() {
+    let layer = document.getElementById(LIVE_CURSOR_LAYER_ID);
+    if (layer) return layer;
+    layer = document.createElement("div");
+    layer.id = LIVE_CURSOR_LAYER_ID;
+    document.body.appendChild(layer);
+    return layer;
+  }
+
+  function renderRemoteLiveCursor(payload) {
+    const point = flowToScreenPoint(Number(payload.x), Number(payload.y));
+    if (!point) return;
+
+    const senderId = String(payload.senderId || "");
+    if (!senderId) return;
+    const layer = ensureLiveCursorLayer();
+    let cursor = liveRemoteCursors.get(senderId)?.element;
+    if (!cursor) {
+      cursor = document.createElement("div");
+      cursor.className = "pixmax-canvas-cloner-live-cursor";
+      cursor.innerHTML = `
+        <span class="pixmax-canvas-cloner-live-cursor-icon"></span>
+        <span class="pixmax-canvas-cloner-live-cursor-name"></span>
+      `;
+      layer.appendChild(cursor);
+    }
+
+    cursor.dataset.stale = "false";
+    cursor.style.setProperty("--pixmax-live-x", `${point.x}px`);
+    cursor.style.setProperty("--pixmax-live-y", `${point.y}px`);
+    cursor.style.setProperty("--pixmax-live-color", normalizeColor(payload.color));
+    cursor.querySelector(".pixmax-canvas-cloner-live-cursor-name").textContent =
+      String(payload.ownerName || "协作者").slice(0, 40);
+    liveRemoteCursors.set(senderId, {
+      element: cursor,
+      lastSeenAt: Date.now(),
+      x: Number(payload.x),
+      y: Number(payload.y)
+    });
+  }
+
+  function hideRemoteLiveCursor(senderId) {
+    const entry = liveRemoteCursors.get(String(senderId || ""));
+    if (entry?.element) entry.element.dataset.stale = "true";
+  }
+
+  function clearLiveRemoteCursors() {
+    for (const entry of liveRemoteCursors.values()) {
+      entry.element?.remove();
+    }
+    liveRemoteCursors.clear();
+    document.getElementById(LIVE_CURSOR_LAYER_ID)?.remove();
+  }
+
+  function startLiveCursorCleanup() {
+    if (liveCursorCleanupTimer) return;
+    liveCursorCleanupTimer = window.setInterval(() => {
+      const now = Date.now();
+      for (const [senderId, entry] of liveRemoteCursors) {
+        const point = flowToScreenPoint(entry.x, entry.y);
+        if (point) {
+          entry.element.style.setProperty("--pixmax-live-x", `${point.x}px`);
+          entry.element.style.setProperty("--pixmax-live-y", `${point.y}px`);
+        }
+        if (now - entry.lastSeenAt > LIVE_REMOTE_CURSOR_TTL_MS) {
+          entry.element.dataset.stale = "true";
+        }
+        if (now - entry.lastSeenAt > LIVE_REMOTE_CURSOR_TTL_MS * 3) {
+          entry.element.remove();
+          liveRemoteCursors.delete(senderId);
+        }
+      }
+      updateLiveToggle();
+    }, 250);
+  }
+
+  function startLiveRevisionPolling() {
+    if (liveRevisionTimer) return;
+    scheduleLiveRevisionCheck("start");
+    liveRevisionTimer = window.setInterval(() => {
+      scheduleLiveRevisionCheck("poll");
+    }, LIVE_REVISION_POLL_INTERVAL_MS);
+  }
+
+  function scheduleLiveRevisionCheck(reason, hintedRevision = null) {
+    if (!hasLiveRemotePeer() && reason !== "start" && reason !== "remote-broadcast") return;
+    window.clearTimeout(scheduleLiveRevisionCheck.timer);
+    scheduleLiveRevisionCheck.timer = window.setTimeout(() => {
+      checkLiveRevision(reason, hintedRevision).catch(() => {});
+    }, reason === "remote-broadcast" ? LIVE_REMOTE_BROADCAST_PULL_DELAY_MS : LIVE_REVISION_CHECK_DELAY_MS);
+  }
+
+  async function checkLiveRevision(reason, hintedRevision = null) {
+    if (!liveOptions?.enabled) return;
+    if (!hasLiveRemotePeer() && reason !== "remote-broadcast") return;
+    if (reason === "remote-broadcast" && hintedRevision && hintedRevision !== liveLastKnownRevision) {
+      liveLastKnownRevision = hintedRevision;
+      pullOfficialLiveRemoteSnapshot(hintedRevision);
+      return;
+    }
+
+    const result = await requestBridge("get-current-canvas-revision", {}, 8000);
+    const revision = result?.revision ?? null;
+    if (revision == null) return;
+
+    if (liveLastKnownRevision == null) {
+      liveLastKnownRevision = revision;
+      return;
+    }
+
+    if (revision === liveLastKnownRevision) return;
+
+    liveLastKnownRevision = revision;
+    const isProbablyLocal = Date.now() - liveLastLocalActivityAt < 4500 && reason !== "remote-broadcast";
+    if (isProbablyLocal) {
+      broadcastLiveRevision(reason, revision);
+      return;
+    }
+
+    showToast("检测到云端画布版本更新，正在通过瑞云官方入口拉取。", false, {
+      duration: 2200
+    });
+    pullOfficialLiveRemoteSnapshot(hintedRevision || revision);
+  }
+
+  async function pullOfficialLiveRemoteSnapshot(revision) {
+    try {
+      const result = await requestBridge(
+        "pull-official-remote-snapshot",
+        { fileUuid: liveOptions?.fileUuid || "", revision },
+        12000
+      );
+      liveOfficialSyncAvailable = Boolean(result?.available);
+      if (result?.available && result.applied) {
+        showToast("已通过瑞云官方同步入口应用云端版本。", false, {
+          duration: 1800
+        });
+      } else if (!result?.available && !liveOfficialSyncWarned) {
+        liveOfficialSyncWarned = true;
+        showToast("没有捕获到瑞云官方拉取入口，请刷新 Pixmax 页面后再试。", true, {
+          duration: 5200
+        });
+      }
+    } catch (error) {
+      showToast(error.message || String(error), true);
+    }
+  }
+
+  function broadcastLiveRevision(reason, revision = liveLastKnownRevision) {
+    if (!liveOptions?.enabled) return;
+    broadcastLivePayload({
+      kind: "pixmax-live-revision",
+      ownerName: liveOptions.ownerName,
+      reason,
+      revision
+    });
+  }
+
+  function scheduleOfficialPresenceAppearance() {
+    if (livePresenceAppearanceScheduled) return;
+    livePresenceAppearanceScheduled = true;
+    window.setTimeout(() => {
+      livePresenceAppearanceScheduled = false;
+      applyOfficialPresenceAppearance();
+    }, 120);
+  }
+
+  function applyOfficialPresenceAppearance() {
+    if (!liveOptions?.enabled || !liveOptions.ownerName) return;
+    const initial = liveOptions.ownerName.trim().slice(0, 1).toUpperCase();
+    const color = normalizeColor(liveOptions.color);
+    const [red, green, blue] = hexToRgb(color);
+    let visiblePresenceCount = 0;
+    for (const element of document.querySelectorAll("div, span, button")) {
+      const text = element.textContent?.trim();
+      if (!text || text.length > 2) continue;
+      const rect = element.getBoundingClientRect();
+      if (
+        rect.width < 20 ||
+        rect.width > 72 ||
+        rect.height < 20 ||
+        rect.height > 72 ||
+        rect.top > 140
+      ) {
+        continue;
+      }
+      const style = getComputedStyle(element);
+      const radius = parseFloat(style.borderRadius) || 0;
+      if (radius < Math.min(rect.width, rect.height) * 0.35) continue;
+      visiblePresenceCount += 1;
+      if (text.toUpperCase() !== initial && !element.dataset.pixmaxHubOwnPresence) continue;
+      if (
+        element.dataset.pixmaxHubOwnPresence === "true" &&
+        element.dataset.pixmaxHubOwnPresenceColor === color &&
+        element.textContent === initial
+      ) {
+        continue;
+      }
+      element.dataset.pixmaxHubOwnPresence = "true";
+      element.dataset.pixmaxHubOwnPresenceColor = color;
+      element.textContent = initial;
+      element.style.setProperty("background", color, "important");
+      element.style.setProperty("background-color", color, "important");
+      element.style.setProperty("border-color", color, "important");
+      element.style.setProperty("color", getReadableTextColor(red, green, blue), "important");
+      element.style.setProperty(
+        "box-shadow",
+        `0 0 0 2px rgb(${red} ${green} ${blue} / 34%)`,
+        "important"
+      );
+    }
+    liveDomPeerCount = Math.max(1, visiblePresenceCount);
+    if (visiblePresenceCount === 1 && livePresencePeerCount > 1 && !hasCollaborationConflictDialog()) {
+      livePresencePeerCount = 1;
+      liveRemoteActivityUntil = 0;
+      updateLiveToggle();
+    }
+  }
+
+  function getReadableTextColor(red, green, blue) {
+    return red * 0.299 + green * 0.587 + blue * 0.114 > 145 ? "#111" : "#fff";
+  }
+
+  function autoResolveCollaborationConflict() {
+    if (!liveOptions?.enabled) return;
+    if (!hasCollaborationConflictDialog()) return;
+    markLiveRemoteActivity();
+    const button = [...document.querySelectorAll("button")].find((item) =>
+      item.textContent.replace(/\s+/g, "").includes("覆盖云端版本")
+    );
+    if (!button) return;
+    button.click();
+    showToast("实时协同已自动选择覆盖云端版本。");
+    scheduleLiveRevisionCheck("auto-conflict");
+  }
+
+  function hasCollaborationConflictDialog() {
+    return Boolean(document.body?.textContent?.includes("文件版本冲突"));
   }
 
   function normalizeColor(value) {
@@ -1076,6 +1966,7 @@
     cleanupLegacyCanvasUi();
     ensureStyle();
     refreshLikedState();
+    syncLiveCollabState();
     focusNode(getFocusNodeId());
     globalThis.chrome?.storage?.onChanged?.addListener((changes, areaName) => {
       if (areaName === "local" && changes[LIKES_STORAGE_KEY]) {
@@ -1096,6 +1987,12 @@
       ) {
         refreshLikedState();
       }
+      if (
+        areaName === "sync" &&
+        (changes.liveCollabEnabled || changes.sharedLikesOwnerName || changes.sharedLikesColor)
+      ) {
+        syncLiveCollabState();
+      }
     });
     scheduleToolbarSync(document.body);
     document.addEventListener(
@@ -1111,6 +2008,8 @@
     );
     new MutationObserver((mutations) => {
       scheduleLegacyCleanup();
+      autoResolveCollaborationConflict();
+      scheduleOfficialPresenceAppearance();
       for (const mutation of mutations) {
         scheduleToolbarSync(mutation.target);
         for (const node of mutation.addedNodes) {
