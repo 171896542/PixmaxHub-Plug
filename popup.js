@@ -197,8 +197,8 @@ function saveSharedLikesOptions() {
     return;
   }
 
-  if ((enabled || liveEnabled) && !ownerName) {
-    setSharedStatus("请填写你的名字，共享 Likes 和实时协同都会用到它。", "error");
+  if (enabled && !ownerName) {
+    setSharedStatus("请填写你的名字，它要和共享画布里的文字节点对应。实时协同可不填。", "error");
     return;
   }
 

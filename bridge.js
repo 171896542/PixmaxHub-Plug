@@ -77,6 +77,8 @@
       if (!userName) return message;
       return {
         ...message,
+        color: normalizeLiveColor(identity.color),
+        profileColor: normalizeLiveColor(identity.color),
         userName
       };
     }

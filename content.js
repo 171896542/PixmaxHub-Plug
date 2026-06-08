@@ -12,22 +12,39 @@
   const ACTIONS_CLASS = "pixmax-canvas-cloner-actions";
   const CONTEXT_PASTE_CLASS = "pixmax-canvas-cloner-context-paste";
   const STYLE_ID = "pixmax-canvas-cloner-style";
-  const STYLE_VERSION = "1.3.9";
+  const OFFICIAL_FOCUS_STYLE_ID = "collab-remote-focus-styles";
+  const LIVE_FOCUS_STYLE_ID = "pixmax-canvas-cloner-live-focus-colors";
+  const LIVE_SELECTION_STYLE_ID = "pixmax-canvas-cloner-live-selection-color";
+  const STYLE_VERSION = "1.4.0";
   const TOAST_ID = "pixmax-canvas-cloner-toast";
   const LIVE_TOGGLE_ID = "pixmax-canvas-cloner-live-toggle";
   const LIVE_CURSOR_LAYER_ID = "pixmax-canvas-cloner-live-cursors";
   const LIKES_STORAGE_KEY = "pixmaxLikedItems";
+  const LIVE_IDENTITY_STORAGE_KEY = "pixmaxHubLiveIdentity";
   const UPDATE_CHECK_STORAGE_KEY = "pixmaxHubUpdateReminder";
   const DEFAULT_GITHUB_UPDATE_URL = "https://github.com/171896542/PixmaxHub-Plug/tree/main";
   const UPDATE_REMINDER_INTERVAL_MS = 6 * 60 * 60 * 1000;
   const DEFAULT_LIKE_COLOR = "#ff3864";
   const LIVE_CURSOR_SEND_INTERVAL_MS = 45;
+  const LIVE_FOCUS_SEND_INTERVAL_MS = 120;
   const LIVE_REMOTE_CURSOR_TTL_MS = 2600;
+  const LIVE_FOCUS_HEARTBEAT_MS = 1800;
+  const LIVE_REMOTE_FOCUS_STALE_MS = 45000;
   const LIVE_REVISION_POLL_INTERVAL_MS = 300;
   const LIVE_SYNC_TRIGGER_INTERVAL_MS = 120;
   const LIVE_REVISION_CHECK_DELAY_MS = 180;
   const LIVE_REMOTE_BROADCAST_PULL_DELAY_MS = 20;
   const LIVE_REMOTE_ACTIVITY_GRACE_MS = 2500;
+  const LIVE_FALLBACK_COLORS = [
+    "#ff3864",
+    "#ffd500",
+    "#4ce2f3",
+    "#6d7cff",
+    "#35d07f",
+    "#ff8a3d",
+    "#b85cff",
+    "#ff66b3"
+  ];
   const SHARED_OPTIONS_DEFAULTS = {
     sharedLikesEnabled: true,
     sharedLikesFileUuid: "",
@@ -49,6 +66,7 @@
   let liveReconnectTimer = 0;
   let liveRevisionTimer = 0;
   let liveCursorCleanupTimer = 0;
+  let liveFocusBroadcastTimer = 0;
   let liveSyncTriggerTimer = 0;
   let liveSocket = null;
   let liveSocketReconnectAttempt = 0;
@@ -58,10 +76,22 @@
   let liveSocketLastMessageAt = 0;
   let liveSocketLastSentAt = 0;
   let liveLastCursorSentAt = 0;
+  let liveLastFocusBroadcastAt = 0;
+  let liveLastFocusHeartbeatAt = 0;
+  let liveLastFocusSignature = "";
   let liveLastSyncTriggeredAt = 0;
   let liveLastLocalActivityAt = 0;
   let liveRemoteActivityUntil = 0;
   let liveLastKnownRevision = null;
+  let liveOfficialFileUuid = "";
+  let liveLastRawMessage = null;
+  let liveLastIncomingPayload = null;
+  let liveLastDroppedPayload = null;
+  let liveLastSentPayload = null;
+  let liveLastProfileBroadcastKey = "";
+  let liveLastProfileBroadcastAt = 0;
+  let liveOfficialClientId = "";
+  let liveOfficialUserId = "";
   let liveSyncInFlight = false;
   let liveSyncQueued = false;
   let liveOptions = null;
@@ -75,6 +105,9 @@
   let livePresenceAppearanceScheduled = false;
   const livePendingNodeIds = new Set();
   const liveRemoteCursors = new Map();
+  const liveRemoteFocuses = new Map();
+  const livePeerProfiles = new Map();
+  let liveFocusSessions = [];
 
   function createRequestId() {
     return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -139,6 +172,9 @@
           enabled: Boolean(liveOptions?.enabled),
           fileUuid: liveOptions?.fileUuid || "",
           ownerName: liveOptions?.ownerName || "",
+          ownerNameSource: liveOptions?.ownerNameSource || "",
+          officialClientId: liveOfficialClientId,
+          officialUserId: liveOfficialUserId,
           connectionKey: liveConnectionKey,
           sessionId: liveSessionId,
           socketReadyState: liveSocket?.readyState ?? null,
@@ -148,6 +184,14 @@
           socketLastMessageAt: liveSocketLastMessageAt,
           socketLastSentAt: liveSocketLastSentAt,
           sideRoom: getLiveSideRoom(),
+          officialFileUuid: liveOfficialFileUuid,
+          acceptedFileUuids: [...getLiveAcceptedFileUuids()],
+          lastSentPayload: liveLastSentPayload,
+          lastRawMessage: liveLastRawMessage,
+          lastIncomingPayload: liveLastIncomingPayload,
+          lastDroppedPayload: liveLastDroppedPayload,
+          peerProfiles: [...livePeerProfiles.values()],
+          focusSessions: liveFocusSessions,
           remoteCursorCount: liveRemoteCursors.size,
           remoteActivityUntil: liveRemoteActivityUntil,
           peerCount: livePresencePeerCount,
@@ -552,20 +596,65 @@
   }
 
   function getLiveSideRoom() {
-    return liveOptions?.fileUuid ? `${liveOptions.fileUuid}:pixmax-hub-live` : "";
+    const fileUuid = getLiveRoomFileUuid();
+    return fileUuid ? `${fileUuid}:pixmax-hub-live` : "";
+  }
+
+  function getLiveRoomFileUuid() {
+    return liveOfficialFileUuid || liveOptions?.fileUuid || getCurrentFileUuid();
+  }
+
+  function getLiveAcceptedFileUuids() {
+    return new Set(
+      [liveOptions?.fileUuid, liveOfficialFileUuid, getCurrentFileUuid()]
+        .map((value) => String(value || "").trim())
+        .filter(Boolean)
+    );
+  }
+
+  function isLivePayloadForThisCanvas(payload) {
+    if (!payload || typeof payload !== "object") return false;
+    const payloadFileUuid = String(payload.fileUuid || payload.roomFileUuid || "").trim();
+    if (!payloadFileUuid) return true;
+    return getLiveAcceptedFileUuids().has(payloadFileUuid);
   }
 
   async function getLiveCollabOptions() {
     const options = await syncStorageGet(SHARED_OPTIONS_DEFAULTS);
     const fileUuid = getCurrentFileUuid();
-    const ownerName = String(options.sharedLikesOwnerName || "").trim();
+    const configuredOwnerName = String(options.sharedLikesOwnerName || "").trim();
+    const fallbackIdentity = configuredOwnerName ? null : await getFallbackLiveIdentity();
+    const ownerName = configuredOwnerName || fallbackIdentity.ownerName;
     return {
-      color: normalizeColor(options.sharedLikesColor),
+      color: configuredOwnerName ? normalizeColor(options.sharedLikesColor) : fallbackIdentity.color,
       enabled: Boolean(options.liveCollabEnabled && fileUuid && ownerName),
       fileUuid,
       ownerName,
+      ownerNameSource: configuredOwnerName ? "configured" : "fallback",
       rawEnabled: Boolean(options.liveCollabEnabled)
     };
+  }
+
+  async function getFallbackLiveIdentity() {
+    const values = await storageGet({ [LIVE_IDENTITY_STORAGE_KEY]: null });
+    const existing = values[LIVE_IDENTITY_STORAGE_KEY];
+    if (existing?.ownerName && /^#[0-9a-f]{6}$/i.test(existing.color || "")) {
+      return {
+        ownerName: String(existing.ownerName).slice(0, 40),
+        color: normalizeColor(existing.color)
+      };
+    }
+
+    const suffix = Math.random().toString(36).slice(2, 6).toUpperCase();
+    const color = LIVE_FALLBACK_COLORS[
+      Math.floor(Math.random() * LIVE_FALLBACK_COLORS.length)
+    ];
+    const identity = {
+      ownerName: `协作者 ${suffix}`,
+      color
+    };
+    await storageSet({ [LIVE_IDENTITY_STORAGE_KEY]: identity }).catch(() => {});
+    return identity;
   }
 
   function ensureLiveToggle() {
@@ -597,12 +686,6 @@
   async function toggleLiveCollabFromPage() {
     try {
       const nextEnabled = !Boolean(liveOptions?.rawEnabled);
-      const options = await syncStorageGet(SHARED_OPTIONS_DEFAULTS);
-      const ownerName = String(options.sharedLikesOwnerName || "").trim();
-      if (nextEnabled && !ownerName) {
-        showToast("请先在扩展弹窗里填写我的名字，再开启实时协同。", true);
-        return;
-      }
       await syncStorageSet({ liveCollabEnabled: nextEnabled });
       showToast(nextEnabled ? "实时协同已开启。" : "实时协同已关闭。");
       await syncLiveCollabState();
@@ -640,26 +723,44 @@
     document.addEventListener("pointermove", handleLivePointerMove, true);
     document.addEventListener("pointerleave", handleLivePointerLeave, true);
     document.addEventListener("pointerup", handleLiveLocalActivity, true);
+    document.addEventListener("click", handleLiveLocalFocusActivity, true);
+    document.addEventListener("keyup", handleLiveLocalFocusActivity, true);
     document.addEventListener("change", handleLiveLocalActivity, true);
     document.addEventListener("input", handleLiveLocalActivity, true);
     configureOfficialPresence();
     startLiveRevisionPolling();
     startLiveCursorCleanup();
+    renderLiveSelectionColor();
   }
 
   function stopLiveCollab() {
     document.removeEventListener("pointermove", handleLivePointerMove, true);
     document.removeEventListener("pointerleave", handleLivePointerLeave, true);
     document.removeEventListener("pointerup", handleLiveLocalActivity, true);
+    document.removeEventListener("click", handleLiveLocalFocusActivity, true);
+    document.removeEventListener("keyup", handleLiveLocalFocusActivity, true);
     document.removeEventListener("change", handleLiveLocalActivity, true);
     document.removeEventListener("input", handleLiveLocalActivity, true);
     window.clearTimeout(liveReconnectTimer);
+    window.clearTimeout(liveFocusBroadcastTimer);
     window.clearTimeout(liveSyncTriggerTimer);
     window.clearInterval(liveRevisionTimer);
     window.clearInterval(liveCursorCleanupTimer);
     liveRevisionTimer = 0;
     liveCursorCleanupTimer = 0;
     liveConnectionKey = "";
+    liveOfficialFileUuid = "";
+    liveOfficialClientId = "";
+    liveOfficialUserId = "";
+    liveLastRawMessage = null;
+    liveLastIncomingPayload = null;
+    liveLastDroppedPayload = null;
+    liveLastSentPayload = null;
+    liveLastProfileBroadcastKey = "";
+    liveLastProfileBroadcastAt = 0;
+    liveLastFocusBroadcastAt = 0;
+    liveLastFocusHeartbeatAt = 0;
+    liveLastFocusSignature = "";
     liveLastKnownRevision = null;
     liveSyncInFlight = false;
     liveSyncQueued = false;
@@ -670,6 +771,12 @@
     liveOfficialSyncAvailable = false;
     liveOfficialSyncWarned = false;
     livePendingNodeIds.clear();
+    liveRemoteFocuses.clear();
+    livePeerProfiles.clear();
+    liveFocusSessions = [];
+    restoreOfficialFocusColors();
+    renderLiveFocusColors();
+    renderLiveSelectionColor();
     clearLiveRemoteCursors();
     updateLiveToggle();
   }
@@ -702,10 +809,13 @@
         JSON.stringify({
           type: "join",
           room,
+          color: liveOptions.color,
+          profileColor: liveOptions.color,
           userId: liveSessionId,
           userName: liveOptions.ownerName
         })
       );
+      window.setTimeout(() => broadcastLiveProfile("side-room-open"), 80);
     });
     socket.addEventListener("message", (event) => {
       liveSocketLastMessageAt = Date.now();
@@ -764,6 +874,7 @@
         4000
       );
       updateLivePresenceStatus(status);
+      broadcastLiveProfile("official-presence");
       if (!status?.available && !liveOfficialSyncWarned) {
         liveOfficialSyncWarned = true;
         showToast("需要刷新 Pixmax 页面，才能把官方在线用户改成你的名字和颜色。", true, {
@@ -779,10 +890,17 @@
   function broadcastLivePayload(payload) {
     const finalPayload = {
       ...payload,
-      fileUuid: liveOptions?.fileUuid || "",
+      color: normalizeColor(payload.color || liveOptions?.color),
+      fileUuid: getLiveRoomFileUuid(),
+      officialClientId: liveOfficialClientId,
+      officialUserId: liveOfficialUserId,
+      ownerName: payload.ownerName || liveOptions?.ownerName || "",
+      roomFileUuid: getLiveRoomFileUuid(),
+      urlFileUuid: liveOptions?.fileUuid || "",
       senderId: liveSessionId,
       sentAt: Date.now()
     };
+    liveLastSentPayload = finalPayload;
     if (liveSocket?.readyState === WebSocket.OPEN) {
       liveSocket.send(JSON.stringify({ type: "broadcast", payload: finalPayload }));
       liveSocketLastSentAt = Date.now();
@@ -796,6 +914,37 @@
     ).catch(() => null);
   }
 
+  function broadcastLiveProfile(reason) {
+    if (!liveOptions?.enabled) return;
+    const profileKey = [
+      liveOptions.ownerName,
+      liveOptions.color,
+      liveOfficialClientId,
+      liveOfficialUserId
+    ].join("|");
+    const now = Date.now();
+    if (
+      reason !== "force" &&
+      profileKey === liveLastProfileBroadcastKey &&
+      now - liveLastProfileBroadcastAt < 1500
+    ) {
+      return;
+    }
+    liveLastProfileBroadcastKey = profileKey;
+    liveLastProfileBroadcastAt = now;
+    rememberLivePeerProfile({
+      color: liveOptions.color,
+      officialClientId: liveOfficialClientId,
+      officialUserId: liveOfficialUserId,
+      ownerName: liveOptions.ownerName,
+      senderId: liveSessionId
+    });
+    broadcastLivePayload({
+      kind: "pixmax-live-profile",
+      reason
+    });
+  }
+
   function handleLiveSocketMessage(value) {
     let message;
     try {
@@ -803,19 +952,36 @@
     } catch {
       return;
     }
+    liveLastRawMessage = message;
 
     updateLivePresenceStatus(message);
+    if (message.type === "room-session-focus" && Array.isArray(message.sessions)) {
+      liveFocusSessions = message.sessions.filter((session) => session?.nodeId);
+      broadcastLiveProfile("focus-session");
+      renderLiveFocusColors();
+    }
 
     const payload = message.payload && typeof message.payload === "object"
       ? message.payload
       : message.type === "broadcast" && message.data && typeof message.data === "object"
         ? message.data
+        : String(message.kind || "").startsWith("pixmax-live-")
+          ? message
         : null;
-    if (!payload || payload.senderId === liveSessionId || payload.fileUuid !== liveOptions?.fileUuid) {
+    if (!payload || payload.senderId === liveSessionId || !isLivePayloadForThisCanvas(payload)) {
+      if (payload) liveLastDroppedPayload = payload;
       return;
     }
 
+    liveLastIncomingPayload = payload;
+    rememberLivePeerProfile(payload);
     markLiveRemoteActivity();
+
+    if (payload.kind === "pixmax-live-profile") {
+      scheduleOfficialPresenceAppearance();
+      renderLiveFocusColors();
+      return;
+    }
 
     if (payload.kind === "pixmax-live-cursor") {
       renderRemoteLiveCursor(payload);
@@ -827,6 +993,11 @@
       return;
     }
 
+    if (payload.kind === "pixmax-live-focus") {
+      renderRemoteLiveFocus(payload);
+      return;
+    }
+
     if (payload.kind === "pixmax-live-revision") {
       scheduleLiveRevisionCheck("remote-broadcast", payload.revision);
       return;
@@ -834,6 +1005,37 @@
   }
 
   function updateLivePresenceStatus(status = {}) {
+    const previousClientId = liveOfficialClientId;
+    const previousUserId = liveOfficialUserId;
+    if (status.clientId) liveOfficialClientId = String(status.clientId || "");
+    if (status.lastJoin?.userId) liveOfficialUserId = String(status.lastJoin.userId || "");
+    if (Array.isArray(status.peers)) {
+      for (const peer of status.peers) {
+        rememberLivePeerProfile(peer);
+        if (
+          liveOfficialClientId &&
+          peer?.clientId === liveOfficialClientId &&
+          peer?.userId &&
+          !liveOfficialUserId
+        ) {
+          liveOfficialUserId = String(peer.userId || "");
+        }
+        if (
+          liveOptions?.ownerName &&
+          String(peer?.userName || "").trim() === liveOptions.ownerName &&
+          peer?.userId &&
+          !liveOfficialUserId
+        ) {
+          liveOfficialUserId = String(peer.userId || "");
+        }
+      }
+    }
+    if (
+      (liveOfficialClientId && liveOfficialClientId !== previousClientId) ||
+      (liveOfficialUserId && liveOfficialUserId !== previousUserId)
+    ) {
+      broadcastLiveProfile("official-id-ready");
+    }
     const nextPeerCount = Number.isFinite(Number(status.peerCount))
       ? Math.max(1, Number(status.peerCount))
       : Array.isArray(status.peers)
@@ -843,6 +1045,7 @@
     livePresencePeerCount = nextPeerCount;
     const hasRemotePeer = hasLiveRemotePeer();
     updateLiveToggle();
+    renderLiveFocusColors();
     if (hasRemotePeer && !hadRemotePeer) {
       liveMultiUserSyncNotified = true;
       if (liveSyncQueued || Date.now() - liveLastLocalActivityAt < 15000) {
@@ -877,6 +1080,205 @@
     }
   }
 
+  function rememberLivePeerProfile(profile = {}) {
+    const ownerName = String(profile.ownerName || profile.userName || "").trim();
+    const color = normalizeOptionalColor(profile.color || profile.profileColor);
+    const keys = [
+      profile.senderId && `sender:${profile.senderId}`,
+      profile.officialUserId && `user:${profile.officialUserId}`,
+      profile.userId && `user:${profile.userId}`,
+      profile.officialClientId && `client:${profile.officialClientId}`,
+      profile.clientId && `client:${profile.clientId}`,
+      ownerName && `name:${ownerName}`
+    ].filter(Boolean);
+    if (!keys.length || !ownerName) return;
+
+    const existing =
+      keys.map((key) => livePeerProfiles.get(key)).find(Boolean) || {};
+    const next = {
+      ...existing,
+      color: color || existing.color || "",
+      ownerName,
+      senderId: profile.senderId || existing.senderId || "",
+      officialUserId: profile.officialUserId || profile.userId || existing.officialUserId || "",
+      officialClientId: profile.officialClientId || profile.clientId || existing.officialClientId || ""
+    };
+    for (const key of keys) livePeerProfiles.set(key, next);
+  }
+
+  function getLiveProfileForSession(session = {}) {
+    const keys = [
+      session.userId && `user:${session.userId}`,
+      session.clientId && `client:${session.clientId}`,
+      session.userName && `name:${session.userName}`,
+      session.ownerName && `name:${session.ownerName}`
+    ].filter(Boolean);
+    for (const key of keys) {
+      const profile = livePeerProfiles.get(key);
+      if (profile) return profile;
+    }
+    const remoteProfiles = getLiveDisplayProfiles().filter((profile) => {
+      if (liveSessionId && profile.senderId === liveSessionId) return false;
+      if (liveOfficialClientId && profile.officialClientId === liveOfficialClientId) return false;
+      if (liveOfficialUserId && profile.officialUserId === liveOfficialUserId) return false;
+      return Boolean(profile.color);
+    });
+    if (remoteProfiles.length === 1) return remoteProfiles[0];
+    return null;
+  }
+
+  function getLiveDisplayProfiles() {
+    const profiles = new Map();
+    if (liveOptions?.ownerName) {
+      profiles.set(`own:${liveOptions.ownerName}`, {
+        color: liveOptions.color,
+        ownerName: liveOptions.ownerName,
+        officialClientId: liveOfficialClientId,
+        officialUserId: liveOfficialUserId,
+        senderId: liveSessionId
+      });
+    }
+    for (const profile of livePeerProfiles.values()) {
+      const key =
+        profile.officialUserId ||
+        profile.officialClientId ||
+        profile.senderId ||
+        profile.ownerName;
+      if (key) profiles.set(key, profile);
+    }
+    return [...profiles.values()];
+  }
+
+  function renderLiveFocusColors() {
+    neutralizeOfficialFocusColors();
+    let style = document.getElementById(LIVE_FOCUS_STYLE_ID);
+    const grouped = new Map();
+    for (const entry of liveRemoteFocuses.values()) {
+      if (!entry.nodeIds.length) continue;
+      for (const nodeId of entry.nodeIds) {
+        const colors = grouped.get(nodeId) || [];
+        if (!colors.includes(entry.color)) colors.push(entry.color);
+        grouped.set(nodeId, colors);
+      }
+    }
+    for (const session of liveFocusSessions) {
+      const nodeId = String(session.nodeId || "").trim();
+      if (!nodeId) continue;
+      const profile = getLiveProfileForSession(session);
+      const color = profile?.color;
+      if (!color) continue;
+      const colors = grouped.get(nodeId) || [];
+      if (!colors.includes(color)) colors.push(color);
+      grouped.set(nodeId, colors);
+    }
+
+    if (!grouped.size) {
+      style?.remove();
+      return;
+    }
+
+    if (!style) {
+      style = document.createElement("style");
+      style.id = LIVE_FOCUS_STYLE_ID;
+      document.head.appendChild(style);
+    }
+    if (style.parentNode === document.head) document.head.appendChild(style);
+
+    const rules = [];
+    for (const [nodeId, colors] of grouped) {
+      const escapedNodeId = window.CSS?.escape ? CSS.escape(nodeId) : nodeId.replace(/"/g, '\\"');
+      const shadows = colors
+        .map((color, index) => `0 0 0 ${2 + index * 2}px ${color}`)
+        .join(", ");
+      rules.push(
+        `#app .svelte-flow__node[data-id="${escapedNodeId}"] { box-shadow: ${shadows} !important; border-radius: 12px; }`,
+        `#app .svelte-flow__node[data-id="${escapedNodeId}"] .node-container,
+         #app .svelte-flow__node[data-id="${escapedNodeId}"] [class*="node-container"] {
+          border-color: ${colors[0]} !important;
+          box-shadow: 0 0 0 1px ${colors[0]} !important;
+        }`,
+        `#app .svelte-flow__node[data-id="${escapedNodeId}"] [class*="border"],
+         #app .svelte-flow__node[data-id="${escapedNodeId}"] [style*="border-color"] {
+          border-color: ${colors[0]} !important;
+        }`,
+        `#app .svelte-flow__node[data-id="${escapedNodeId}"]::before {
+          border-color: ${colors[0]} !important;
+          box-shadow: ${shadows} !important;
+        }`
+      );
+    }
+    style.textContent = rules.join("\n");
+  }
+
+  function neutralizeOfficialFocusColors() {
+    if (!liveOptions?.enabled) return;
+    const style = document.getElementById(OFFICIAL_FOCUS_STYLE_ID);
+    if (!style) return;
+    style.dataset.pixmaxHubDisabledFocus = "true";
+    style.disabled = true;
+  }
+
+  function restoreOfficialFocusColors() {
+    const style = document.getElementById(OFFICIAL_FOCUS_STYLE_ID);
+    if (!style || style.dataset.pixmaxHubDisabledFocus !== "true") return;
+    style.disabled = false;
+    delete style.dataset.pixmaxHubDisabledFocus;
+  }
+
+  function renderLiveSelectionColor() {
+    let style = document.getElementById(LIVE_SELECTION_STYLE_ID);
+    if (!liveOptions?.enabled || !liveOptions.color) {
+      style?.remove();
+      return;
+    }
+
+    const color = normalizeColor(liveOptions.color);
+    const [red, green, blue] = hexToRgb(color);
+    const soft = `rgb(${red} ${green} ${blue} / 22%)`;
+    const glow = `rgb(${red} ${green} ${blue} / 46%)`;
+    if (!style) {
+      style = document.createElement("style");
+      style.id = LIVE_SELECTION_STYLE_ID;
+      document.head.appendChild(style);
+    }
+
+    style.textContent = `
+      #app .svelte-flow__node.selected,
+      #app .svelte-flow__node[aria-selected="true"],
+      #app .svelte-flow__node[data-selected="true"] {
+        border-color: ${color} !important;
+        border-radius: 12px !important;
+        box-shadow: 0 0 0 2px ${color}, 0 0 0 6px ${soft} !important;
+      }
+
+      #app .svelte-flow__node.selected .node-container,
+      #app .svelte-flow__node[aria-selected="true"] .node-container,
+      #app .svelte-flow__node[data-selected="true"] .node-container,
+      #app .svelte-flow__node.selected [class*="node-container"],
+      #app .svelte-flow__node[aria-selected="true"] [class*="node-container"],
+      #app .svelte-flow__node[data-selected="true"] [class*="node-container"] {
+        border-color: ${color} !important;
+        box-shadow: 0 0 0 1px ${color}, 0 0 0 5px ${soft} !important;
+      }
+
+      #app .svelte-flow__node.selected [class*="border"],
+      #app .svelte-flow__node[aria-selected="true"] [class*="border"],
+      #app .svelte-flow__node[data-selected="true"] [class*="border"],
+      #app .svelte-flow__node.selected [style*="border-color"],
+      #app .svelte-flow__node[aria-selected="true"] [style*="border-color"],
+      #app .svelte-flow__node[data-selected="true"] [style*="border-color"] {
+        border-color: ${color} !important;
+      }
+
+      #app .svelte-flow__node.selected::before,
+      #app .svelte-flow__node[aria-selected="true"]::before,
+      #app .svelte-flow__node[data-selected="true"]::before {
+        border-color: ${color} !important;
+        box-shadow: 0 0 12px ${glow} !important;
+      }
+    `;
+  }
+
   function getFlowTransform() {
     const pane = document.querySelector(".svelte-flow__pane") || document.querySelector(".svelte-flow");
     const viewport = document.querySelector(".svelte-flow__viewport");
@@ -909,6 +1311,8 @@
 
   function handleLivePointerMove(event) {
     if (!liveOptions?.enabled || event.pointerType === "touch") return;
+    broadcastLiveProfile("pointer");
+    scheduleLiveFocusBroadcast("pointer", 80);
     if (event.buttons && event.target?.closest?.(".svelte-flow")) {
       markLiveDirtyNodes(event.target);
       scheduleLiveOfficialSync();
@@ -937,17 +1341,106 @@
     });
   }
 
+  function handleLiveLocalFocusActivity() {
+    if (!liveOptions?.enabled) return;
+    scheduleLiveFocusBroadcast("focus-activity", 60);
+  }
+
   function handleLiveLocalActivity() {
     if (!liveOptions?.enabled) return;
+    broadcastLiveProfile("local-activity");
+    scheduleLiveFocusBroadcast("local-activity", 80);
     liveLastLocalActivityAt = Date.now();
     scheduleLiveOfficialSync();
     scheduleLiveRevisionCheck("local-activity");
   }
 
+  function scheduleLiveFocusBroadcast(reason, delay = 80) {
+    window.clearTimeout(liveFocusBroadcastTimer);
+    liveFocusBroadcastTimer = window.setTimeout(() => {
+      broadcastLiveFocus(reason);
+    }, delay);
+  }
+
+  function getSelectedLiveNodeIds() {
+    const selectors = [
+      `${NODE_SELECTOR}.selected`,
+      `${NODE_SELECTOR}[aria-selected="true"]`,
+      `${NODE_SELECTOR}[data-selected="true"]`
+    ].join(",");
+    return [...document.querySelectorAll(selectors)]
+      .map((node) => node.dataset.id || node.getAttribute("data-id") || "")
+      .map((id) => String(id || "").trim())
+      .filter(Boolean)
+      .sort();
+  }
+
+  function broadcastLiveFocus(reason) {
+    if (!liveOptions?.enabled) return;
+    const now = Date.now();
+    const nodeIds = getSelectedLiveNodeIds();
+    const signature = nodeIds.join("|");
+    if (
+      signature === liveLastFocusSignature &&
+      now - liveLastFocusBroadcastAt < LIVE_FOCUS_SEND_INTERVAL_MS
+    ) {
+      return;
+    }
+    liveLastFocusSignature = signature;
+    liveLastFocusBroadcastAt = now;
+    broadcastLiveProfile("focus");
+    broadcastLivePayload({
+      kind: "pixmax-live-focus",
+      color: liveOptions.color,
+      nodeIds,
+      ownerName: liveOptions.ownerName,
+      reason
+    });
+  }
+
+  function maybeBroadcastLiveFocusHeartbeat(now) {
+    if (!liveOptions?.enabled) return;
+    if (now - liveLastFocusHeartbeatAt < LIVE_FOCUS_HEARTBEAT_MS) return;
+    const nodeIds = getSelectedLiveNodeIds();
+    if (!nodeIds.length) return;
+    liveLastFocusHeartbeatAt = now;
+    liveLastFocusSignature = "";
+    broadcastLiveFocus("focus-heartbeat");
+  }
+
+  function renderRemoteLiveFocus(payload = {}) {
+    const senderId = String(payload.senderId || "");
+    if (!senderId) return;
+    const nodeIds = Array.isArray(payload.nodeIds)
+      ? payload.nodeIds.map((id) => String(id || "").trim()).filter(Boolean)
+      : [];
+    liveRemoteFocuses.set(senderId, {
+      color: normalizeColor(payload.color),
+      lastSeenAt: Date.now(),
+      nodeIds,
+      ownerName: String(payload.ownerName || "协作者").slice(0, 40)
+    });
+    renderLiveFocusColors();
+  }
+
   async function refreshOfficialLiveSyncStatus() {
     try {
+      const previousSideRoom = getLiveSideRoom();
       const status = await requestBridge("get-official-live-sync-status", {}, 4000);
       liveOfficialSyncAvailable = Boolean(status?.available);
+      if (status?.fileUuid) {
+        liveOfficialFileUuid = String(status.fileUuid || "").trim();
+        const nextSideRoom = getLiveSideRoom();
+        if (
+          liveOptions?.enabled &&
+          previousSideRoom &&
+          nextSideRoom &&
+          previousSideRoom !== nextSideRoom
+        ) {
+          closeLiveSocket({ reconnect: false });
+          connectLiveSocket();
+        }
+      }
       if (!liveOfficialSyncAvailable && !liveOfficialSyncWarned) {
         liveOfficialSyncWarned = true;
         showToast("实时协同需要刷新 Pixmax 页面后捕获瑞云官方同步入口。", true, {
@@ -1088,6 +1581,15 @@
           liveRemoteCursors.delete(senderId);
         }
       }
+      let focusChanged = false;
+      for (const [senderId, entry] of liveRemoteFocuses) {
+        if (now - entry.lastSeenAt > LIVE_REMOTE_FOCUS_STALE_MS) {
+          liveRemoteFocuses.delete(senderId);
+          focusChanged = true;
+        }
+      }
+      if (focusChanged) renderLiveFocusColors();
+      maybeBroadcastLiveFocusHeartbeat(now);
       updateLiveToggle();
     }, 250);
   }
@@ -1185,9 +1687,14 @@
 
   function applyOfficialPresenceAppearance() {
     if (!liveOptions?.enabled || !liveOptions.ownerName) return;
-    const initial = liveOptions.ownerName.trim().slice(0, 1).toUpperCase();
-    const color = normalizeColor(liveOptions.color);
-    const [red, green, blue] = hexToRgb(color);
+    const profiles = getLiveDisplayProfiles()
+      .filter((profile) => profile?.ownerName && profile?.color)
+      .map((profile) => ({
+        ...profile,
+        color: normalizeColor(profile.color),
+        initial: String(profile.ownerName || "").trim().slice(0, 1).toUpperCase()
+      }));
+    if (!profiles.length) return;
     let visiblePresenceCount = 0;
     for (const element of document.querySelectorAll("div, span, button")) {
       const text = element.textContent?.trim();
@@ -1206,17 +1713,24 @@
       const radius = parseFloat(style.borderRadius) || 0;
       if (radius < Math.min(rect.width, rect.height) * 0.35) continue;
       visiblePresenceCount += 1;
-      if (text.toUpperCase() !== initial && !element.dataset.pixmaxHubOwnPresence) continue;
+      const existingKey = element.dataset.pixmaxHubPresenceKey || "";
+      const profile =
+        profiles.find((item) => getLivePresenceProfileKey(item) === existingKey) ||
+        profiles.find((item) => text.toUpperCase() === item.initial);
+      if (!profile) continue;
+      const profileKey = getLivePresenceProfileKey(profile);
+      const color = normalizeColor(profile.color);
+      const [red, green, blue] = hexToRgb(color);
       if (
-        element.dataset.pixmaxHubOwnPresence === "true" &&
-        element.dataset.pixmaxHubOwnPresenceColor === color &&
-        element.textContent === initial
+        element.dataset.pixmaxHubPresenceKey === profileKey &&
+        element.dataset.pixmaxHubPresenceColor === color &&
+        element.textContent === profile.initial
       ) {
         continue;
       }
-      element.dataset.pixmaxHubOwnPresence = "true";
-      element.dataset.pixmaxHubOwnPresenceColor = color;
-      element.textContent = initial;
+      element.dataset.pixmaxHubPresenceKey = profileKey;
+      element.dataset.pixmaxHubPresenceColor = color;
+      element.textContent = profile.initial;
       element.style.setProperty("background", color, "important");
       element.style.setProperty("background-color", color, "important");
       element.style.setProperty("border-color", color, "important");
@@ -1233,6 +1747,16 @@
       liveRemoteActivityUntil = 0;
       updateLiveToggle();
     }
+  }
+
+  function getLivePresenceProfileKey(profile = {}) {
+    return (
+      profile.officialUserId ||
+      profile.officialClientId ||
+      profile.senderId ||
+      profile.ownerName ||
+      ""
+    );
   }
 
   function getReadableTextColor(red, green, blue) {
@@ -1259,6 +1783,11 @@
   function normalizeColor(value) {
     const color = String(value || "").trim();
     return /^#[0-9a-f]{6}$/i.test(color) ? color.toLowerCase() : DEFAULT_LIKE_COLOR;
+  }
+
+  function normalizeOptionalColor(value) {
+    const color = String(value || "").trim();
+    return /^#[0-9a-f]{6}$/i.test(color) ? color.toLowerCase() : "";
   }
 
   function normalizeGithubUpdateUrl(value) {
@@ -2010,6 +2539,20 @@
       scheduleLegacyCleanup();
       autoResolveCollaborationConflict();
       scheduleOfficialPresenceAppearance();
+      neutralizeOfficialFocusColors();
+      if (liveOptions?.enabled) {
+        for (const mutation of mutations) {
+          if (
+            mutation.type === "attributes" &&
+            (mutation.attributeName === "class" ||
+              mutation.attributeName === "aria-selected" ||
+              mutation.attributeName === "data-selected")
+          ) {
+            scheduleLiveFocusBroadcast("selection-mutation", 80);
+            break;
+          }
+        }
+      }
       for (const mutation of mutations) {
         scheduleToolbarSync(mutation.target);
         for (const node of mutation.addedNodes) {
@@ -2017,6 +2560,8 @@
         }
       }
     }).observe(document.body, {
+      attributes: true,
+      attributeFilter: ["class", "aria-selected", "data-selected"],
       childList: true,
       subtree: true
     });
