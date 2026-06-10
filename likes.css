@@ -280,13 +280,63 @@ body.multi-select .card {
 }
 
 .preview {
-  display: grid;
-  min-height: 190px;
-  aspect-ratio: 4 / 3;
+  display: flex;
+  height: clamp(190px, 16vw, 260px);
+  min-height: 0;
+  aspect-ratio: auto;
+  overflow: hidden;
+  align-items: center;
+  justify-content: center;
   place-items: center;
   background: #0f1012;
   color: #858b95;
   text-decoration: none;
+}
+
+.preview.media-preview {
+  cursor: zoom-in;
+}
+
+.preview.media-preview.expanded {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  width: 100vw;
+  height: 100vh;
+  min-height: 0;
+  aspect-ratio: auto;
+  padding: 28px;
+  box-sizing: border-box;
+  align-items: center;
+  justify-content: center;
+  background: rgb(0 0 0 / 88%);
+  cursor: zoom-out;
+}
+
+.preview.media-preview.expanded img {
+  width: auto;
+  height: auto;
+  max-width: min(1320px, calc(100vw - 56px));
+  max-height: calc(100vh - 56px);
+  object-fit: contain;
+  border-radius: 8px;
+  background: #000;
+  box-shadow: 0 22px 70px rgb(0 0 0 / 62%);
+}
+
+.preview.media-preview.expanded video {
+  width: min(1320px, calc(100vw - 56px));
+  height: auto;
+  max-height: calc(100vh - 56px);
+  object-fit: contain;
+  border-radius: 8px;
+  background: #000;
+  box-shadow: 0 22px 70px rgb(0 0 0 / 62%);
+}
+
+body.media-expanded {
+  overflow: hidden;
 }
 
 .card[data-like-color] {
@@ -307,10 +357,21 @@ body.multi-select .card {
   background: var(--owner-color);
 }
 
-.preview img,
-.preview video {
+.preview img {
+  display: block;
   width: 100%;
   height: 100%;
+  min-width: 0;
+  min-height: 0;
+  object-fit: contain;
+}
+
+.preview video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
   object-fit: cover;
 }
 
@@ -665,6 +726,10 @@ body.multi-select #batchEagle {
 
   .owner-filters {
     top: 0;
+  }
+
+  .preview {
+    height: clamp(180px, 58vw, 260px);
   }
 }
 

@@ -2,7 +2,8 @@
 
 const MESSAGE = {
   EAGLE_IMPORT_URL: "pixmax-cloner:eagle-import-url",
-  EAGLE_LIST_FOLDERS: "pixmax-cloner:eagle-list-folders"
+  EAGLE_LIST_FOLDERS: "pixmax-cloner:eagle-list-folders",
+  OPEN_REVIEW_BOARD: "pixmax-cloner:open-review-board"
 };
 
 const DEFAULT_OPTIONS = {
@@ -28,8 +29,23 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === MESSAGE.OPEN_REVIEW_BOARD) {
+    openReviewBoard()
+      .then((result) => sendResponse({ ok: true, ...result }))
+      .catch((error) => sendResponse({ ok: false, error: friendlyError(error) }));
+    return true;
+  }
+
   return false;
 });
+
+async function openReviewBoard() {
+  const tab = await chrome.tabs.create({
+    active: true,
+    url: chrome.runtime.getURL("likes.html")
+  });
+  return { tabId: tab?.id };
+}
 
 async function listEagleFolders() {
   const options = await getStoredOptions();

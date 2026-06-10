@@ -1,6 +1,7 @@
 ﻿"use strict";
 
 const LIKES_STORAGE_KEY = "pixmaxLikedItems";
+const REVIEW_VIDEO_SOUND_KEY = "pixmaxReviewVideoSoundEnabled";
 const FOCUS_PARAM = "pixmaxClonerFocus";
 const API_ORIGIN = "https://app.pixmax.cn";
 const SHARED_LIKES_MARKER = "PIXMAX_CANVAS_CLONER_LIKES_V1";
@@ -32,6 +33,7 @@ const ownerFilters = document.querySelector("#ownerFilters");
 const reviewStats = document.querySelector("#reviewStats");
 const searchLikesInput = document.querySelector("#searchLikes");
 const statusFilterButtons = [...document.querySelectorAll("[data-status-filter]")];
+const refreshLikesButton = document.querySelector("#refreshLikes");
 const togglePromptsButton = document.querySelector("#togglePrompts");
 const multiSelectButton = document.querySelector("#multiSelect");
 const batchEagleButton = document.querySelector("#batchEagle");
@@ -52,17 +54,27 @@ let activeSearchQuery = "";
 let activeStatusFilter = "all";
 let activeSourceItems = [];
 let activeRenderOptions = {};
+let reviewVideoSoundEnabled = true;
+let expandedMediaPreview = null;
 
 init();
 
 function init() {
   document.body.classList.add("prompts-hidden");
+  chrome.storage.local.get({ [REVIEW_VIDEO_SOUND_KEY]: true }, (result) => {
+    reviewVideoSoundEnabled = result[REVIEW_VIDEO_SOUND_KEY] !== false;
+    syncReviewVideoSoundPreference();
+  });
+  refreshLikesButton?.addEventListener("click", refreshLikes);
   togglePromptsButton.addEventListener("click", togglePrompts);
   multiSelectButton.addEventListener("click", toggleMultiSelect);
   batchEagleButton.addEventListener("click", importSelectedLikesToEagle);
   exportHtmlButton.addEventListener("click", exportHtml);
   exportJsonButton.addEventListener("click", exportJson);
   clearButton.addEventListener("click", clearLikes);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && expandedMediaPreview) collapseReviewMediaPreview();
+  });
   searchLikesInput?.addEventListener("input", () => {
     activeSearchQuery = searchLikesInput.value.trim().toLowerCase();
     renderFilteredItems();
@@ -95,27 +107,47 @@ function init() {
 }
 
 function loadLikes() {
-  chrome.storage.sync.get(SHARED_OPTIONS_DEFAULTS, async (options) => {
-    sharedOptions = getSharedOptions(options);
-    sharedMode = sharedOptions.enabled;
+  return new Promise((resolve) => {
+    chrome.storage.sync.get(SHARED_OPTIONS_DEFAULTS, async (options) => {
+      sharedOptions = getSharedOptions(options);
+      sharedMode = sharedOptions.enabled;
 
-    if (sharedMode) {
-      try {
-        const result = await getSharedLikedItems(sharedOptions);
-        allSharedItems = result.allItems;
-        renderOwnerFilters(allSharedItems, sharedOptions.ownerName);
-      } catch (error) {
-        renderError(error.message || String(error));
+      if (sharedMode) {
+        try {
+          const result = await getSharedLikedItems(sharedOptions);
+          allSharedItems = result.allItems;
+          renderOwnerFilters(allSharedItems, sharedOptions.ownerName);
+        } catch (error) {
+          renderError(error.message || String(error));
+        } finally {
+          resolve();
+        }
+        return;
       }
-      return;
-    }
 
-    chrome.storage.local.get({ [LIKES_STORAGE_KEY]: [] }, (result) => {
-      allSharedItems = [];
-      renderOwnerFilters([]);
-      setActiveItems(Array.isArray(result[LIKES_STORAGE_KEY]) ? result[LIKES_STORAGE_KEY] : []);
+      chrome.storage.local.get({ [LIKES_STORAGE_KEY]: [] }, (result) => {
+        allSharedItems = [];
+        renderOwnerFilters([]);
+        setActiveItems(Array.isArray(result[LIKES_STORAGE_KEY]) ? result[LIKES_STORAGE_KEY] : []);
+        resolve();
+      });
     });
   });
+}
+
+async function refreshLikes() {
+  if (!refreshLikesButton) return;
+  refreshLikesButton.disabled = true;
+  refreshLikesButton.textContent = "刷新中...";
+  try {
+    await loadLikes();
+    refreshLikesButton.textContent = "已刷新";
+  } finally {
+    window.setTimeout(() => {
+      refreshLikesButton.textContent = "刷新收藏库";
+      refreshLikesButton.disabled = false;
+    }, 650);
+  }
 }
 
 function renderOwnerFilters(items, preferredOwner = "") {
@@ -348,6 +380,9 @@ function renderItem(item) {
 
   const mediaUrl = normalizeUrl(item.url);
   const pageUrl = normalizeUrl(item.website) || mediaUrl;
+  const isVideo = isVideoUrl(mediaUrl);
+  const isAudio = isAudioUrl(mediaUrl);
+  const isExpandableMedia = Boolean(mediaUrl && !isAudio);
   const likeColor = normalizeColor(item.likedByColor);
   const likeKey = getLikeKey(item);
 
@@ -365,7 +400,27 @@ function renderItem(item) {
   select.addEventListener("change", () => {
     updateSelectedKey(likeKey, select.checked);
   });
-  preview.href = mediaUrl || pageUrl || "#";
+  if (isExpandableMedia) {
+    preview.removeAttribute("href");
+    preview.classList.add("media-preview");
+    if (isVideo) preview.classList.add("video-preview");
+    else preview.classList.add("image-preview");
+    preview.setAttribute("role", "button");
+    preview.tabIndex = 0;
+    preview.title = isVideo ? "点击画面放大/缩小视频" : "点击图片放大/缩小";
+    preview.addEventListener("click", (event) => {
+      event.preventDefault();
+      if (isLikelyVideoControlClick(event)) return;
+      toggleReviewMediaPreview(preview);
+    });
+    preview.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      toggleReviewMediaPreview(preview);
+    });
+  } else {
+    preview.href = mediaUrl || pageUrl || "#";
+  }
   preview.append(createPreview(item));
   title.textContent = item.name || filenameFromUrl(mediaUrl) || "Pixmax result";
   prompt.textContent = item.annotation || "No prompt captured.";
@@ -702,19 +757,25 @@ function createPreview(item) {
   const url = normalizeUrl(item?.url);
   if (!url) return document.createTextNode("No preview");
 
-  if (/\.(mp4|webm|mov)(\?|#|$)/i.test(url)) {
+  if (isVideoUrl(url)) {
     const video = document.createElement("video");
     const poster = normalizeUrl(item.poster || item.thumbnailUrl || item.previewUrl);
     video.src = url;
     video.controls = true;
-    video.muted = true;
+    video.muted = !reviewVideoSoundEnabled;
     video.playsInline = true;
     video.preload = "metadata";
+    video.dataset.reviewVideo = "true";
+    video.addEventListener("volumechange", () => {
+      const enabled = !video.muted && video.volume > 0;
+      if (enabled === reviewVideoSoundEnabled) return;
+      setReviewVideoSoundPreference(enabled);
+    });
     if (poster) video.poster = poster;
     return video;
   }
 
-  if (/\.(mp3|wav|m4a|aac|ogg)(\?|#|$)/i.test(url)) {
+  if (isAudioUrl(url)) {
     const audio = document.createElement("audio");
     audio.src = url;
     audio.controls = true;
@@ -730,6 +791,70 @@ function createPreview(item) {
     image.replaceWith(document.createTextNode("Preview unavailable"));
   });
   return image;
+}
+
+function isVideoUrl(url) {
+  return /\.(mp4|webm|mov)(\?|#|$)/i.test(String(url || ""));
+}
+
+function isAudioUrl(url) {
+  return /\.(mp3|wav|m4a|aac|ogg)(\?|#|$)/i.test(String(url || ""));
+}
+
+function isLikelyVideoControlClick(event) {
+  const video = event.currentTarget?.querySelector?.("video");
+  if (!video) return false;
+  const rect = video.getBoundingClientRect();
+  if (!rect.width || !rect.height) return false;
+  const controlHeight = Math.min(56, Math.max(38, rect.height * 0.18));
+  return event.clientY >= rect.bottom - controlHeight;
+}
+
+function toggleReviewMediaPreview(preview) {
+  if (!preview?.classList?.contains("media-preview")) return;
+  if (expandedMediaPreview === preview) {
+    collapseReviewMediaPreview();
+    return;
+  }
+  expandReviewMediaPreview(preview);
+}
+
+function expandReviewMediaPreview(preview) {
+  if (expandedMediaPreview && expandedMediaPreview !== preview) {
+    collapseReviewMediaPreview();
+  }
+  expandedMediaPreview = preview;
+  document.body.classList.add("media-expanded");
+  preview.classList.add("expanded");
+  preview.setAttribute("aria-expanded", "true");
+  const video = preview.querySelector("video");
+  if (video) applyReviewVideoSoundPreference(video);
+}
+
+function collapseReviewMediaPreview() {
+  if (!expandedMediaPreview) return;
+  expandedMediaPreview.classList.remove("expanded");
+  expandedMediaPreview.setAttribute("aria-expanded", "false");
+  expandedMediaPreview = null;
+  document.body.classList.remove("media-expanded");
+}
+
+function setReviewVideoSoundPreference(enabled) {
+  reviewVideoSoundEnabled = Boolean(enabled);
+  chrome.storage.local.set({ [REVIEW_VIDEO_SOUND_KEY]: reviewVideoSoundEnabled }, () => {});
+  syncReviewVideoSoundPreference();
+}
+
+function syncReviewVideoSoundPreference() {
+  for (const video of document.querySelectorAll("video[data-review-video='true']")) {
+    applyReviewVideoSoundPreference(video);
+  }
+}
+
+function applyReviewVideoSoundPreference(video) {
+  if (!video) return;
+  video.muted = !reviewVideoSoundEnabled;
+  if (reviewVideoSoundEnabled && video.volume === 0) video.volume = 1;
 }
 
 function getLikeKey(item) {

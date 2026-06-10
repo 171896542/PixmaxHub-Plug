@@ -15,9 +15,10 @@
   const OFFICIAL_FOCUS_STYLE_ID = "collab-remote-focus-styles";
   const LIVE_FOCUS_STYLE_ID = "pixmax-canvas-cloner-live-focus-colors";
   const LIVE_SELECTION_STYLE_ID = "pixmax-canvas-cloner-live-selection-color";
-  const STYLE_VERSION = "1.4.0";
+  const STYLE_VERSION = "1.4.7";
   const TOAST_ID = "pixmax-canvas-cloner-toast";
   const LIVE_TOGGLE_ID = "pixmax-canvas-cloner-live-toggle";
+  const OPEN_LIKES_BUTTON_ID = "pixmax-canvas-cloner-open-likes";
   const LIVE_CURSOR_LAYER_ID = "pixmax-canvas-cloner-live-cursors";
   const LIKES_STORAGE_KEY = "pixmaxLikedItems";
   const LIVE_IDENTITY_STORAGE_KEY = "pixmaxHubLiveIdentity";
@@ -394,8 +395,139 @@
         box-shadow: 0 6px 16px rgb(0 0 0 / 45%);
         font: 12px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       }
+      #${OPEN_LIKES_BUTTON_ID} {
+        cursor: pointer;
+      }
+      #${OPEN_LIKES_BUTTON_ID} svg {
+        fill: none;
+        color: inherit;
+        opacity: .82;
+        stroke: currentColor;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: 1.75;
+      }
+      #${OPEN_LIKES_BUTTON_ID} svg:not([class]) {
+        width: 24px;
+        height: 24px;
+      }
     `;
     document.head.appendChild(style);
+  }
+
+  function ensureOpenLikesButton() {
+    const target = findCopyShareButton();
+    if (!target?.parentElement) {
+      document.getElementById(OPEN_LIKES_BUTTON_ID)?.remove();
+      return;
+    }
+
+    const sourceClass = target.getAttribute("class") || "";
+    let button = document.getElementById(OPEN_LIKES_BUTTON_ID);
+    if (!button || button.dataset.pixmaxSourceClass !== sourceClass) {
+      button?.remove();
+      button = createOpenLikesButton(target, sourceClass);
+    }
+    if (button.nextElementSibling !== target) {
+      target.parentElement.insertBefore(button, target);
+    }
+  }
+
+  function createOpenLikesButton(target, sourceClass) {
+    const button = target.cloneNode(false);
+    button.id = OPEN_LIKES_BUTTON_ID;
+    button.dataset.pixmaxSourceClass = sourceClass || "";
+    if (button instanceof HTMLButtonElement) button.type = "button";
+    button.removeAttribute("href");
+    button.removeAttribute("target");
+    button.removeAttribute("rel");
+    button.removeAttribute("disabled");
+    button.removeAttribute("aria-disabled");
+    button.querySelectorAll?.("[id]").forEach((element) => element.removeAttribute("id"));
+    button.title = "打开 Pixmax Review Board";
+    button.setAttribute("aria-label", "打开 Pixmax Review Board");
+    button.innerHTML = createOpenLikesHeartSvg(target);
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      requestExtension("open-review-board", {}, 5000).catch((error) => {
+        showToast(error.message || "无法打开 Review Board。", true);
+      });
+    });
+    return button;
+  }
+
+  function createOpenLikesHeartSvg(target) {
+    const nativeSvgClass = target.querySelector?.("svg")?.getAttribute("class") || "";
+    const classAttribute = nativeSvgClass ? ` class="${escapeHtmlAttribute(nativeSvgClass)}"` : "";
+    return `
+      <svg${classAttribute} viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M12 20.1S5.2 16.2 5.2 10.3a3.7 3.7 0 0 1 6.5-2.4l.3.4.3-.4a3.7 3.7 0 0 1 6.5 2.4c0 5.9-6.8 9.8-6.8 9.8Z"/>
+      </svg>
+    `;
+  }
+
+  function escapeHtmlAttribute(value) {
+    return String(value).replace(/[&<>"']/g, (char) => (
+      {
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;"
+      }[char]
+    ));
+  }
+
+  function findCopyShareButton() {
+    const candidates = getTopActionCandidates();
+    const exact = candidates.find((candidate) => {
+      const label = getElementLabel(candidate).replace(/\s+/g, "");
+      return label.includes("复制分享链接") || (label.includes("复制") && label.includes("分享"));
+    });
+    if (exact) return exact;
+
+    const squareButtons = candidates
+      .filter((candidate) => {
+        const rect = candidate.getBoundingClientRect();
+        const label = getElementLabel(candidate).trim();
+        const isSingleLetterAvatar = /^[A-Za-z]$/.test(label);
+        return (
+          !isSingleLetterAvatar &&
+          rect.width >= 40 &&
+          rect.width <= 86 &&
+          rect.height >= 40 &&
+          rect.height <= 86
+        );
+      })
+      .sort((first, second) => first.getBoundingClientRect().left - second.getBoundingClientRect().left);
+    return squareButtons[1] || squareButtons[0] || null;
+  }
+
+  function getTopActionCandidates() {
+    return [...document.querySelectorAll("button, [role='button'], a")]
+      .filter((element) => {
+        if (!(element instanceof HTMLElement)) return false;
+        if (element.id === OPEN_LIKES_BUTTON_ID || element.closest(`#${OPEN_LIKES_BUTTON_ID}`)) return false;
+        if (element.closest(`.${ACTIONS_CLASS}, .${CONTEXT_PASTE_CLASS}, ${TOOLBAR_SELECTOR}`)) return false;
+        const rect = element.getBoundingClientRect();
+        if (!rect.width || !rect.height) return false;
+        if (rect.top < 0 || rect.top > 160) return false;
+        if (rect.left < 120) return false;
+        return true;
+      });
+  }
+
+  function getElementLabel(element) {
+    return [
+      element.getAttribute("aria-label"),
+      element.getAttribute("title"),
+      element.getAttribute("data-tooltip"),
+      element.getAttribute("data-title"),
+      element.textContent
+    ]
+      .filter(Boolean)
+      .join(" ");
   }
 
   function cleanupLegacyCanvasUi() {
@@ -2490,10 +2622,18 @@
     }, 50);
   }
 
+  function scheduleOpenLikesButtonRetries() {
+    for (const delay of [250, 800, 1600, 3200]) {
+      window.setTimeout(ensureOpenLikesButton, delay);
+    }
+  }
+
   function mount() {
     if (!document.body) return;
     cleanupLegacyCanvasUi();
     ensureStyle();
+    ensureOpenLikesButton();
+    scheduleOpenLikesButtonRetries();
     refreshLikedState();
     syncLiveCollabState();
     focusNode(getFocusNodeId());
@@ -2537,6 +2677,7 @@
     );
     new MutationObserver((mutations) => {
       scheduleLegacyCleanup();
+      ensureOpenLikesButton();
       autoResolveCollaborationConflict();
       scheduleOfficialPresenceAppearance();
       neutralizeOfficialFocusColors();

@@ -5,7 +5,8 @@
   const REQUEST_EVENT = "pixmax-canvas-cloner:extension-request";
   const RESPONSE_EVENT = "pixmax-canvas-cloner:extension-response";
   const MESSAGE_TYPES = {
-    "eagle-import-url": "pixmax-cloner:eagle-import-url"
+    "eagle-import-url": "pixmax-cloner:eagle-import-url",
+    "open-review-board": "pixmax-cloner:open-review-board"
   };
 
   function respond(requestId, ok, payload = {}) {
