@@ -770,28 +770,27 @@ async function deleteSharedUserData(fileUuid, ownerName, retryCount = 1) {
   const canvas = await fetchSharedCanvas(fileUuid);
   const nodes = canvas.nodes ?? [];
   const update = [];
-  const deleteUuids = [];
 
   for (const node of nodes.filter(isTextLikeNode)) {
     const text = getRawNodeText(node);
     const parsedOwner = parseSharedLikeText(text);
     if (parsedOwner?.ownerName === ownerName) {
-      deleteUuids.push(node.uuid);
+      update.push({
+        uuid: node.uuid,
+        metaData: buildNodeMetaDataWithLabel(node, `已删除用户 - ${ownerName}`),
+        nodeText: buildDeletedSharedUserText(ownerName)
+      });
       continue;
     }
 
     const index = parseLikeIndexText(text);
     if (index?.owners.some((owner) => owner.ownerName === ownerName)) {
       const nextOwners = index.owners.filter((owner) => owner.ownerName !== ownerName);
-      if (nextOwners.length) {
-        update.push({
-          uuid: node.uuid,
-          metaData: node.metaData || "{}",
-          nodeText: buildLikeIndexText({ owners: nextOwners })
-        });
-      } else {
-        deleteUuids.push(node.uuid);
-      }
+      update.push({
+        uuid: node.uuid,
+        metaData: node.metaData || "{}",
+        nodeText: buildLikeIndexText({ owners: nextOwners })
+      });
       continue;
     }
 
@@ -808,7 +807,7 @@ async function deleteSharedUserData(fileUuid, ownerName, retryCount = 1) {
     }
   }
 
-  if (!deleteUuids.length && !update.length) {
+  if (!update.length) {
     throw new Error(`共享画布里没有找到用户「${ownerName}」。`);
   }
 
@@ -817,7 +816,7 @@ async function deleteSharedUserData(fileUuid, ownerName, retryCount = 1) {
     baseRevision: canvas.revision,
     create: [],
     update,
-    delete: deleteUuids
+    delete: []
   });
 
   if (!result.success) {
@@ -826,6 +825,24 @@ async function deleteSharedUserData(fileUuid, ownerName, retryCount = 1) {
     }
     throw new Error(result.errMessage || result.errCode || "删除共享用户失败。");
   }
+}
+
+function buildDeletedSharedUserText(ownerName) {
+  return [
+    `已删除用户：${ownerName}`,
+    `Deleted at: ${new Date().toISOString()}`
+  ].join("\n");
+}
+
+function buildNodeMetaDataWithLabel(node, label) {
+  const metaData = parseNodeMetaData(node);
+  return JSON.stringify({
+    ...metaData,
+    data: {
+      ...(metaData.data || {}),
+      label
+    }
+  });
 }
 
 function removeUserFromSocialData(data, ownerName) {
