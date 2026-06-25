@@ -164,3 +164,99 @@ details[open] summary {
   width: 16px;
   min-height: 16px;
 }
+
+.shared-users-panel {
+  margin-top: 14px;
+  border: 1px solid #30343a;
+  border-radius: 7px;
+  background: #1e2024;
+  padding: 9px 10px;
+}
+
+.shared-users-panel summary {
+  font-size: 12px;
+}
+
+.shared-users-panel[open] summary {
+  margin-bottom: 10px;
+}
+
+.shared-users-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.shared-users-head span {
+  color: #a9adb5;
+  font-size: 12px;
+}
+
+.shared-users-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.shared-user-empty,
+.shared-user-row {
+  border: 1px solid #30343a;
+  border-radius: 7px;
+  background: #17191d;
+}
+
+.shared-user-empty {
+  color: #858b95;
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 10px;
+}
+
+.shared-user-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+}
+
+.shared-user-meta {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  column-gap: 7px;
+  row-gap: 2px;
+}
+
+.shared-user-dot {
+  grid-row: 1 / 3;
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: var(--shared-user-color, #ff3864);
+}
+
+.shared-user-name {
+  overflow: hidden;
+  color: #f3f4f6;
+  font-size: 12px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shared-user-count {
+  color: #a9adb5;
+  font-size: 11px;
+}
+
+.shared-user-row button {
+  min-height: 28px;
+  padding: 0 9px;
+}
+
+.shared-user-delete {
+  color: #ffb1aa;
+}

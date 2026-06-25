@@ -6,6 +6,10 @@ const MESSAGE = {
 
 const API_ORIGIN = "https://app.pixmax.cn";
 const SHARED_LIKES_MARKER = "PIXMAX_CANVAS_CLONER_LIKES_V1";
+const LIKE_INDEX_MARKER = "PIXMAX_CANVAS_CLONER_LIKE_INDEX_V1";
+const LIKE_INDEX_NODE_LABEL = "Pixmax Likes Index";
+const SOCIAL_DATA_MARKER = "PIXMAX_LIKES_SOCIAL_V1";
+const SOCIAL_DATA_NODE_LABEL = "Pixmax Likes Review Data";
 const UPDATE_DIRECTORY_DB = "pixmax-canvas-cloner-update";
 const UPDATE_DIRECTORY_STORE = "handles";
 const UPDATE_DIRECTORY_KEY = "extensionDirectory";
@@ -59,6 +63,8 @@ const sharedLikesColorText = document.querySelector("#sharedLikesColorText");
 const createSharedUserButton = document.querySelector("#createSharedUser");
 const saveSharedLikesButton = document.querySelector("#saveSharedLikes");
 const sharedStatus = document.querySelector("#sharedStatus");
+const refreshSharedUsersButton = document.querySelector("#refreshSharedUsers");
+const sharedUsersList = document.querySelector("#sharedUsersList");
 const githubUpdateUrl = document.querySelector("#githubUpdateUrl");
 const checkUpdateButton = document.querySelector("#checkUpdate");
 const applyUpdateButton = document.querySelector("#applyUpdate");
@@ -104,6 +110,7 @@ function init() {
       );
     }
     scheduleSharedUserStateRefresh();
+    window.setTimeout(() => refreshSharedUsers({ silent: true }), 700);
     if (options.githubUpdateUrl) {
       window.setTimeout(() => checkForUpdate({ silent: true }), 600);
     }
@@ -120,6 +127,7 @@ function init() {
   sharedLikesColor.addEventListener("change", scheduleSharedColorSync);
   createSharedUserButton.addEventListener("click", createSharedUser);
   saveSharedLikesButton.addEventListener("click", saveSharedLikesOptions);
+  refreshSharedUsersButton.addEventListener("click", refreshSharedUsers);
   githubUpdateUrl.addEventListener("change", saveGithubUpdateUrl);
   checkUpdateButton.addEventListener("click", () => checkForUpdate());
   applyUpdateButton.addEventListener("click", applyPendingUpdate);
@@ -184,10 +192,10 @@ function saveSelectedFolder() {
   );
 }
 
-function saveSharedLikesOptions() {
+async function saveSharedLikesOptions() {
   const canvasUrl = sharedLikesCanvasUrl.value.trim();
   const ownerName = sharedLikesOwnerName.value.trim();
-  const color = normalizeColor(sharedLikesColor.value);
+  let color = normalizeColor(sharedLikesColor.value);
   const enabled = sharedLikesEnabled.checked;
   const liveEnabled = liveCollabEnabled.checked;
   const fileUuid = extractFileUuid(canvasUrl);
@@ -202,40 +210,55 @@ function saveSharedLikesOptions() {
     return;
   }
 
-  chrome.storage.sync.set(
-    {
+  try {
+    let inheritedUser = null;
+    if (enabled) {
+      const canvas = await fetchSharedCanvas(fileUuid);
+      inheritedUser = getSharedUserSummaries(canvas.nodes ?? []).find((user) => user.ownerName === ownerName) || null;
+      if (inheritedUser) {
+        color = normalizeColor(inheritedUser.color);
+        sharedLikesColor.value = color;
+        sharedLikesColorText.textContent = color;
+      }
+    }
+
+    await storageSyncSet({
       sharedLikesEnabled: enabled,
       sharedLikesCanvasUrl: canvasUrl,
       sharedLikesFileUuid: fileUuid,
       sharedLikesOwnerName: ownerName,
       sharedLikesColor: color,
       liveCollabEnabled: liveEnabled
-    },
-    () => {
-      const runtimeError = chrome.runtime.lastError;
-      if (runtimeError) {
-        setSharedStatus(runtimeError.message, "error");
-        return;
-      }
+    });
 
-      const enabledFeatures = [
-        enabled ? "共享 Likes" : "",
-        liveEnabled ? "实时协同" : ""
-      ].filter(Boolean);
-      setSharedStatus(
-        enabledFeatures.length
-          ? `已启用${enabledFeatures.join("、")}：${ownerName}`
-          : "已关闭共享 Likes 和实时协同，收藏会回到本地保存。",
-        "success"
-      );
-      if (enabled) {
+    const enabledFeatures = [
+      enabled ? "共享 Likes" : "",
+      liveEnabled ? "实时协同" : ""
+    ].filter(Boolean);
+    setSharedStatus(
+      enabledFeatures.length
+        ? `已启用${enabledFeatures.join("、")}：${ownerName}`
+        : "已关闭共享 Likes 和实时协同，收藏会回到本地保存。",
+      "success"
+    );
+
+    if (enabled) {
+      if (inheritedUser) {
+        setSharedStatus(
+          `已继承用户：${ownerName}，颜色 ${color}，${inheritedUser.itemCount} 个收藏。`,
+          "success"
+        );
+      } else {
         updateSharedUserColor(fileUuid, ownerName, color).then(
           () => setSharedStatus(`已启用共享 Likes：${ownerName}，颜色已同步。`, "success"),
           (error) => setSharedStatus(error.message || String(error), "error")
         );
       }
     }
-  );
+    await refreshSharedUsers({ silent: true });
+  } catch (error) {
+    setSharedStatus(error.message || String(error), "error");
+  }
 }
 
 function saveGithubUpdateUrl() {
@@ -301,6 +324,7 @@ async function createSharedUser() {
       "success"
     );
     await refreshSharedUserState();
+    await refreshSharedUsers({ silent: true });
   } catch (error) {
     setSharedStatus(error.message || String(error), "error");
     createSharedUserButton.disabled = false;
@@ -379,14 +403,23 @@ async function refreshSharedUserState() {
   setCreateUserBusy(true, "检查中...");
   try {
     const canvas = await fetchSharedCanvas(fileUuid);
-    const exists = Boolean(findSharedLikesOwnerNode(canvas.nodes ?? [], ownerName));
+    const users = getSharedUserSummaries(canvas.nodes ?? []);
+    const existingUser = users.find((user) => user.ownerName === ownerName);
+    const exists = Boolean(existingUser);
     createSharedUserButton.disabled = exists;
-    createSharedUserButton.textContent = exists ? "已创建" : "创建用户";
+    createSharedUserButton.textContent = exists ? "使用已有用户" : "创建用户";
     if (exists) {
-      setSharedStatus(`共享画布里已有用户：${ownerName}`, "success");
+      const inheritedColor = normalizeColor(existingUser.color);
+      sharedLikesColor.value = inheritedColor;
+      sharedLikesColorText.textContent = inheritedColor;
+      setSharedStatus(
+        `共享画布里已有用户：${ownerName}，会继承 ${existingUser.itemCount} 个收藏和颜色 ${inheritedColor}。`,
+        "success"
+      );
     } else {
       setSharedStatus("这个名字还没有创建，可以点击创建用户。", "");
     }
+    renderSharedUsers(users);
   } catch (error) {
     createSharedUserButton.disabled = true;
     createSharedUserButton.textContent = "创建用户";
@@ -396,7 +429,142 @@ async function refreshSharedUserState() {
 
 function setCreateUserBusy(busy, text = "") {
   if (text) createSharedUserButton.textContent = text;
-  createSharedUserButton.disabled = busy || createSharedUserButton.textContent === "已创建";
+  createSharedUserButton.disabled = busy || createSharedUserButton.textContent === "使用已有用户";
+}
+
+async function refreshSharedUsers(options = {}) {
+  const silent = Boolean(options.silent);
+  const fileUuid = extractFileUuid(sharedLikesCanvasUrl.value.trim());
+  if (!fileUuid) {
+    renderSharedUsers([]);
+    if (!silent) setSharedStatus("请先填写数据库链接。", "error");
+    return;
+  }
+
+  refreshSharedUsersButton.disabled = true;
+  if (!silent) refreshSharedUsersButton.textContent = "刷新中...";
+  try {
+    const canvas = await fetchSharedCanvas(fileUuid);
+    renderSharedUsers(getSharedUserSummaries(canvas.nodes ?? []));
+    if (!silent) setSharedStatus("用户列表已刷新。", "success");
+  } catch (error) {
+    renderSharedUsers([]);
+    if (!silent) setSharedStatus(error.message || String(error), "error");
+  } finally {
+    refreshSharedUsersButton.disabled = false;
+    refreshSharedUsersButton.textContent = "刷新";
+  }
+}
+
+function renderSharedUsers(users) {
+  sharedUsersList.textContent = "";
+  if (!users.length) {
+    const empty = document.createElement("div");
+    empty.className = "shared-user-empty";
+    empty.textContent = "还没有共享用户。";
+    sharedUsersList.append(empty);
+    return;
+  }
+
+  const currentOwner = sharedLikesOwnerName.value.trim();
+  for (const user of users) {
+    const row = document.createElement("div");
+    row.className = "shared-user-row";
+    row.style.setProperty("--shared-user-color", normalizeColor(user.color));
+
+    const meta = document.createElement("div");
+    meta.className = "shared-user-meta";
+
+    const dot = document.createElement("span");
+    dot.className = "shared-user-dot";
+    dot.setAttribute("aria-hidden", "true");
+
+    const name = document.createElement("span");
+    name.className = "shared-user-name";
+    name.textContent = user.ownerName;
+
+    const count = document.createElement("span");
+    count.className = "shared-user-count";
+    count.textContent = `${user.itemCount} 个收藏${user.duplicateCount ? `，${user.duplicateCount + 1} 个同名节点` : ""}`;
+
+    meta.append(dot, name, count);
+
+    const useButton = document.createElement("button");
+    useButton.type = "button";
+    useButton.textContent = user.ownerName === currentOwner ? "当前" : "使用";
+    useButton.disabled = user.ownerName === currentOwner;
+    useButton.addEventListener("click", () => useSharedUser(user));
+
+    const deleteButton = document.createElement("button");
+    deleteButton.type = "button";
+    deleteButton.className = "shared-user-delete";
+    deleteButton.textContent = "删除";
+    deleteButton.addEventListener("click", () => deleteSharedUser(user));
+
+    row.append(meta, useButton, deleteButton);
+    sharedUsersList.append(row);
+  }
+}
+
+async function useSharedUser(user) {
+  const canvasUrl = sharedLikesCanvasUrl.value.trim();
+  const fileUuid = extractFileUuid(canvasUrl);
+  if (!fileUuid) {
+    setSharedStatus("请先填写数据库链接。", "error");
+    return;
+  }
+
+  const color = normalizeColor(user.color);
+  sharedLikesOwnerName.value = user.ownerName;
+  sharedLikesColor.value = color;
+  sharedLikesColorText.textContent = color;
+
+  try {
+    await storageSyncSet({
+      sharedLikesCanvasUrl: canvasUrl,
+      sharedLikesFileUuid: fileUuid,
+      sharedLikesOwnerName: user.ownerName,
+      sharedLikesColor: color
+    });
+    setSharedStatus(`已切换到用户：${user.ownerName}，继承 ${user.itemCount} 个收藏。`, "success");
+    await refreshSharedUserState();
+    await refreshSharedUpdateDirectoryLabel(fileUuid, user.ownerName);
+  } catch (error) {
+    setSharedStatus(error.message || String(error), "error");
+  }
+}
+
+async function deleteSharedUser(user) {
+  const fileUuid = extractFileUuid(sharedLikesCanvasUrl.value.trim());
+  if (!fileUuid) {
+    setSharedStatus("请先填写数据库链接。", "error");
+    return;
+  }
+  const confirmed = confirm(
+    `确定删除用户「${user.ownerName}」和他的 ${user.itemCount} 个收藏吗？这个操作会修改共享画布。`
+  );
+  if (!confirmed) return;
+
+  refreshSharedUsersButton.disabled = true;
+  try {
+    await deleteSharedUserData(fileUuid, user.ownerName);
+    if (sharedLikesOwnerName.value.trim() === user.ownerName) {
+      await storageSyncSet({
+        sharedLikesOwnerName: "",
+        sharedLikesColor: DEFAULT_LIKE_COLOR
+      });
+      sharedLikesOwnerName.value = "";
+      sharedLikesColor.value = DEFAULT_LIKE_COLOR;
+      sharedLikesColorText.textContent = DEFAULT_LIKE_COLOR;
+    }
+    setSharedStatus(`已删除用户：${user.ownerName}`, "success");
+    await refreshSharedUsers({ silent: true });
+    await refreshSharedUserState();
+  } catch (error) {
+    setSharedStatus(error.message || String(error), "error");
+  } finally {
+    refreshSharedUsersButton.disabled = false;
+  }
 }
 
 function extractFileUuid(value) {
@@ -453,6 +621,220 @@ function parseSharedLikeText(value) {
   } catch {
     return null;
   }
+}
+
+function parseLikeIndexText(value) {
+  const text = String(value || "");
+  const markerIndex = text.indexOf(LIKE_INDEX_MARKER);
+  if (markerIndex < 0) return null;
+  const jsonStart = text.indexOf("{", markerIndex + LIKE_INDEX_MARKER.length);
+  if (jsonStart < 0) return null;
+
+  try {
+    const data = JSON.parse(text.slice(jsonStart).trim());
+    if (!data || data.version !== 1 || !Array.isArray(data.owners)) return null;
+    return normalizeLikeIndex(data);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeLikeIndex(data = {}) {
+  return {
+    owners: Array.isArray(data.owners)
+      ? data.owners
+          .filter((owner) => owner && typeof owner === "object")
+          .map((owner) => ({
+            color: normalizeColor(owner.color),
+            keys: [...new Set((Array.isArray(owner.keys) ? owner.keys : []).map(String).filter(Boolean))],
+            ownerName: String(owner.ownerName || "").trim()
+          }))
+          .filter((owner) => owner.ownerName)
+      : []
+  };
+}
+
+function buildLikeIndexText(data) {
+  const normalized = normalizeLikeIndex(data);
+  return [
+    LIKE_INDEX_NODE_LABEL,
+    LIKE_INDEX_MARKER,
+    JSON.stringify(
+      {
+        version: 1,
+        updatedAt: new Date().toISOString(),
+        owners: normalized.owners
+      },
+      null,
+      2
+    )
+  ].join("\n");
+}
+
+function parseSocialDataText(value) {
+  const text = String(value || "");
+  const markerIndex = text.indexOf(SOCIAL_DATA_MARKER);
+  if (markerIndex < 0) return null;
+  const jsonStart = text.indexOf("{", markerIndex + SOCIAL_DATA_MARKER.length);
+  if (jsonStart < 0) return null;
+
+  try {
+    const data = JSON.parse(text.slice(jsonStart).trim());
+    if (!data || data.version !== 1) return null;
+    return normalizeSocialData(data);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeSocialData(data = {}) {
+  return {
+    comments: normalizeSocialEntries(data.comments, ["id", "text"]),
+    likes: normalizeSocialEntries(data.likes),
+    reviews: normalizeSocialEntries(data.reviews, ["status", "tags", "updatedAt"])
+  };
+}
+
+function normalizeSocialEntries(entries, extraKeys = []) {
+  return Array.isArray(entries)
+    ? entries
+        .filter((entry) => entry && typeof entry === "object")
+        .map((entry) => {
+          const normalized = {
+            targetKey: String(entry.targetKey || ""),
+            targetOwner: String(entry.targetOwner || ""),
+            userName: String(entry.userName || "").trim(),
+            color: normalizeColor(entry.color),
+            createdAt: String(entry.createdAt || "")
+          };
+          for (const key of extraKeys) {
+            if (key === "tags") normalized.tags = Array.isArray(entry.tags) ? entry.tags : [];
+            else normalized[key] = entry[key];
+          }
+          return normalized;
+        })
+        .filter((entry) => entry.targetKey && entry.userName)
+    : [];
+}
+
+function buildSocialDataText(data) {
+  const normalized = normalizeSocialData(data);
+  return [
+    SOCIAL_DATA_NODE_LABEL,
+    SOCIAL_DATA_MARKER,
+    JSON.stringify(
+      {
+        version: 1,
+        updatedAt: new Date().toISOString(),
+        likes: normalized.likes,
+        comments: normalized.comments,
+        reviews: normalized.reviews
+      },
+      null,
+      2
+    )
+  ].join("\n");
+}
+
+function getSharedUserSummaries(nodes) {
+  const usersByName = new Map();
+  for (const node of nodes.filter(isTextLikeNode)) {
+    const parsed = parseSharedLikeText(getRawNodeText(node));
+    if (!parsed?.ownerName) continue;
+
+    const existing = usersByName.get(parsed.ownerName);
+    const itemCount = parsed.items.length;
+    if (existing) {
+      existing.itemCount += itemCount;
+      existing.duplicateCount += 1;
+      existing.nodeUuids.push(node.uuid);
+      continue;
+    }
+
+    usersByName.set(parsed.ownerName, {
+      color: parsed.color,
+      duplicateCount: 0,
+      itemCount,
+      nodeUuids: [node.uuid],
+      ownerName: parsed.ownerName
+    });
+  }
+
+  return [...usersByName.values()].sort((first, second) => {
+    const countDelta = second.itemCount - first.itemCount;
+    return countDelta || first.ownerName.localeCompare(second.ownerName);
+  });
+}
+
+async function deleteSharedUserData(fileUuid, ownerName, retryCount = 1) {
+  const canvas = await fetchSharedCanvas(fileUuid);
+  const nodes = canvas.nodes ?? [];
+  const update = [];
+  const deleteUuids = [];
+
+  for (const node of nodes.filter(isTextLikeNode)) {
+    const text = getRawNodeText(node);
+    const parsedOwner = parseSharedLikeText(text);
+    if (parsedOwner?.ownerName === ownerName) {
+      deleteUuids.push(node.uuid);
+      continue;
+    }
+
+    const index = parseLikeIndexText(text);
+    if (index?.owners.some((owner) => owner.ownerName === ownerName)) {
+      const nextOwners = index.owners.filter((owner) => owner.ownerName !== ownerName);
+      if (nextOwners.length) {
+        update.push({
+          uuid: node.uuid,
+          metaData: node.metaData || "{}",
+          nodeText: buildLikeIndexText({ owners: nextOwners })
+        });
+      } else {
+        deleteUuids.push(node.uuid);
+      }
+      continue;
+    }
+
+    const socialData = parseSocialDataText(text);
+    if (socialData) {
+      const nextSocialData = removeUserFromSocialData(socialData, ownerName);
+      if (JSON.stringify(nextSocialData) !== JSON.stringify(socialData)) {
+        update.push({
+          uuid: node.uuid,
+          metaData: node.metaData || "{}",
+          nodeText: buildSocialDataText(nextSocialData)
+        });
+      }
+    }
+  }
+
+  if (!deleteUuids.length && !update.length) {
+    throw new Error(`共享画布里没有找到用户「${ownerName}」。`);
+  }
+
+  const result = await apiPost("/canvas/node/batch", {
+    fileUuid,
+    baseRevision: canvas.revision,
+    create: [],
+    update,
+    delete: deleteUuids
+  });
+
+  if (!result.success) {
+    if (result.errCode === CANVAS_REVISION_CONFLICT && retryCount > 0) {
+      return deleteSharedUserData(fileUuid, ownerName, retryCount - 1);
+    }
+    throw new Error(result.errMessage || result.errCode || "删除共享用户失败。");
+  }
+}
+
+function removeUserFromSocialData(data, ownerName) {
+  const keepEntry = (entry) => entry.userName !== ownerName && entry.targetOwner !== ownerName;
+  return {
+    comments: data.comments.filter(keepEntry),
+    likes: data.likes.filter(keepEntry),
+    reviews: data.reviews.filter(keepEntry)
+  };
 }
 
 async function updateSharedUserColor(fileUuid, ownerName, color, retryCount = 1) {

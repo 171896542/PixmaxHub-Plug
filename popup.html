@@ -41,6 +41,14 @@
         <button id="createSharedUser" class="secondary" type="button" disabled>创建用户</button>
         <button id="saveSharedLikes" class="secondary" type="button">保存共享设置</button>
         <p id="sharedStatus" class="status">在共享画布里创建一个同名文字节点后启用。</p>
+        <details class="shared-users-panel">
+          <summary>目前用户</summary>
+          <div class="shared-users-head">
+            <span>用户列表</span>
+            <button id="refreshSharedUsers" class="secondary compact" type="button">刷新</button>
+          </div>
+          <div id="sharedUsersList" class="shared-users-list" aria-live="polite"></div>
+        </details>
       </details>
 
       <details class="section">
