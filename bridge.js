@@ -480,6 +480,56 @@
     return "";
   }
 
+  function getAssetUuid(asset) {
+    return String(asset?.assetsUuid || asset?.assetUuid || asset?.uuid || asset?.id || "").trim();
+  }
+
+  function compactId(value, length = 12) {
+    return String(value || "").replace(/[^0-9a-z]/gi, "").slice(0, length);
+  }
+
+  function buildDownloadCode(asset, nodeId) {
+    const assetCode = compactId(getAssetUuid(asset));
+    const nodeCode = compactId(nodeId);
+    return assetCode && nodeCode ? `${assetCode}-${nodeCode}` : assetCode || nodeCode;
+  }
+
+  function extractVideoWatchKeyFromUrl(value) {
+    const url = String(value || "").trim();
+    if (!url) return "";
+    const resMatch = url.match(/RES-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+    if (resMatch) return `res:${resMatch[0].toLowerCase()}`;
+    try {
+      const parsed = new URL(url, location.href);
+      parsed.hash = "";
+      parsed.search = "";
+      return `url:${parsed.href}`;
+    } catch {
+      return `url:${url.split(/[?#]/, 1)[0]}`;
+    }
+  }
+
+  function getRawNodeVideoWatchKey(rawNode) {
+    const asset = rawNode?.defaultAsset || {};
+    const url = resolveAssetUrl(asset);
+    if (inferAssetMediaType(asset, url) !== "video") return "";
+    return (
+      extractVideoWatchKeyFromUrl(url) ||
+      (getAssetUuid(asset) ? `asset:${getAssetUuid(asset).toLowerCase()}` : "") ||
+      (rawNode?.uuid ? `node:${String(rawNode.uuid).toLowerCase()}` : "")
+    );
+  }
+
+  function getCanvasVideoWatchKeys(canvas) {
+    return [
+      ...new Set(
+        (canvas?.nodes || [])
+          .map(getRawNodeVideoWatchKey)
+          .filter(Boolean)
+      )
+    ];
+  }
+
   function resolveAssetPath(asset, path) {
     if (!path) return "";
     if (/^https?:\/\//i.test(path)) return path;
@@ -583,6 +633,32 @@
     } catch {
       return null;
     }
+  }
+
+  function normalizeVideoKeys(keys) {
+    return [...new Set(keys.map((key) => String(key || "").trim()).filter(Boolean))];
+  }
+
+  function getWatchedVideoKeys(settings = {}) {
+    return normalizeVideoKeys(Array.isArray(settings.watchedVideoKeys) ? settings.watchedVideoKeys : []);
+  }
+
+  function getKnownVideoKeys(settings = {}) {
+    return normalizeVideoKeys(Array.isArray(settings.knownVideoKeys) ? settings.knownVideoKeys : []);
+  }
+
+  function getUnreadVideoKeys(settings = {}) {
+    return normalizeVideoKeys(Array.isArray(settings.unreadVideoKeys) ? settings.unreadVideoKeys : []);
+  }
+
+  function getWatchedVideoCanvasBaselines(settings = {}) {
+    const baselines = settings.watchedVideoCanvasBaselines;
+    if (!baselines || typeof baselines !== "object" || Array.isArray(baselines)) return {};
+    return Object.fromEntries(
+      Object.entries(baselines)
+        .map(([key, value]) => [String(key || "").trim(), String(value || "").trim()])
+        .filter(([key, value]) => key && value)
+    );
   }
 
   function decodeJsonString(value) {
@@ -986,6 +1062,184 @@
     return getSharedLikesFromCanvas(canvas, ownerName);
   }
 
+  async function getWatchedVideoState(payload) {
+    const { color, fileUuid, ownerName } = parseSharedOptions(payload);
+    const canvas = await fetchCanvas(fileUuid);
+    const ownerNode = findSharedLikesOwnerNode(canvas.nodes ?? [], ownerName);
+    const parsed = ownerNode ? parseSharedLikeText(getRawNodeText(ownerNode)) : null;
+    const settings = parsed?.settings && typeof parsed.settings === "object" ? parsed.settings : {};
+    const watchedVideoKeys = getWatchedVideoKeys(settings);
+    let knownVideoKeys = getKnownVideoKeys(settings);
+    let unreadVideoKeys = getUnreadVideoKeys(settings).filter((key) => !watchedVideoKeys.includes(key));
+    const sourceFileUuid = String(payload?.sourceFileUuid || "").trim();
+    const canvasBaselines = getWatchedVideoCanvasBaselines(settings);
+    const hasKnownModel = Boolean(settings.knownVideoModelAt);
+    let changed = unreadVideoKeys.length !== getUnreadVideoKeys(settings).length;
+    if (!hasKnownModel && unreadVideoKeys.length) {
+      unreadVideoKeys = [];
+      changed = true;
+    }
+
+    if (ownerNode && sourceFileUuid) {
+      if (sourceFileUuid) {
+        try {
+          const sourceCanvas = await fetchCanvas(sourceFileUuid);
+          const sourceKeys = getCanvasVideoWatchKeys(sourceCanvas);
+          if (!hasKnownModel || !canvasBaselines[sourceFileUuid]) {
+            knownVideoKeys = normalizeVideoKeys([...knownVideoKeys, ...sourceKeys]);
+            canvasBaselines[sourceFileUuid] = new Date().toISOString();
+            changed = true;
+          } else {
+            for (const key of sourceKeys) {
+              if (knownVideoKeys.includes(key)) continue;
+              knownVideoKeys.push(key);
+              if (!watchedVideoKeys.includes(key) && !unreadVideoKeys.includes(key)) unreadVideoKeys.push(key);
+              changed = true;
+            }
+          }
+        } catch {
+          // The review board should still work if the source canvas is unavailable.
+        }
+      }
+    }
+
+    if (ownerNode && changed) {
+      const nextSettings = {
+        ...settings,
+        knownVideoModelAt: settings.knownVideoModelAt || new Date().toISOString(),
+        knownVideoKeys: normalizeVideoKeys(knownVideoKeys),
+        unreadVideoKeys: normalizeVideoKeys(unreadVideoKeys),
+        watchedVideoCanvasBaselines: canvasBaselines
+      };
+      persistWatchedVideoSettings(fileUuid, canvas, ownerName, ownerNode, parsed, color, nextSettings).catch(() => {});
+    }
+
+    return { knownVideoKeys, unreadVideoKeys, watchedVideoKeys };
+  }
+
+  async function persistWatchedVideoSettings(fileUuid, canvas, ownerName, ownerNode, parsed, color, settings, retryCount = 1) {
+    const updateResult = await apiPostResult("/canvas/node/batch", {
+      fileUuid,
+      baseRevision: canvas.revision,
+      create: [],
+      update: [
+        {
+          uuid: ownerNode.uuid,
+          metaData: ownerNode.metaData || "{}",
+          nodeText: buildSharedLikeText(ownerName, parsed?.items || [], color || parsed?.color, settings)
+        }
+      ],
+      delete: []
+    });
+
+    if (!updateResult.success) {
+      if (updateResult.errCode === CANVAS_REVISION_CONFLICT && retryCount > 0) {
+        const nextCanvas = await fetchCanvas(fileUuid);
+        const nextOwnerNode = findSharedLikesOwnerNode(nextCanvas.nodes ?? [], ownerName);
+        const nextParsed = nextOwnerNode ? parseSharedLikeText(getRawNodeText(nextOwnerNode)) : parsed;
+        if (!nextOwnerNode) throw new Error(`共享画布里找不到名字为「${ownerName}」的文字节点。`);
+        return persistWatchedVideoSettings(
+          fileUuid,
+          nextCanvas,
+          ownerName,
+          nextOwnerNode,
+          nextParsed,
+          color,
+          {
+            ...(nextParsed?.settings || {}),
+            ...settings,
+            knownVideoModelAt:
+              settings.knownVideoModelAt || nextParsed?.settings?.knownVideoModelAt || new Date().toISOString(),
+            watchedVideoKeys: [
+              ...new Set([
+                ...getWatchedVideoKeys(nextParsed?.settings),
+                ...getWatchedVideoKeys(settings)
+              ])
+            ],
+            knownVideoKeys: [
+              ...new Set([
+                ...getKnownVideoKeys(nextParsed?.settings),
+                ...getKnownVideoKeys(settings)
+              ])
+            ],
+            unreadVideoKeys: [
+              ...new Set([
+                ...getUnreadVideoKeys(nextParsed?.settings),
+                ...getUnreadVideoKeys(settings)
+              ])
+            ],
+            watchedVideoCanvasBaselines: {
+              ...getWatchedVideoCanvasBaselines(nextParsed?.settings),
+              ...getWatchedVideoCanvasBaselines(settings)
+            }
+          },
+          retryCount - 1
+        );
+      }
+      throw new Error(updateResult.errMessage || updateResult.errCode || "视频看过状态写入失败。");
+    }
+  }
+
+  async function markVideoWatched(payload, retryCount = 1) {
+    const { color, fileUuid, ownerName } = parseSharedOptions(payload);
+    const watchKey = String(payload?.watchKey || "").trim();
+    if (!watchKey) return getWatchedVideoState(payload);
+
+    const canvas = await fetchCanvas(fileUuid);
+    const ownerNode = findSharedLikesOwnerNode(canvas.nodes ?? [], ownerName);
+    if (!ownerNode) {
+      throw new Error(`共享画布里找不到名字为「${ownerName}」的文字节点。`);
+    }
+
+    const parsed = parseSharedLikeText(getRawNodeText(ownerNode));
+    const settings = parsed?.settings && typeof parsed.settings === "object" ? parsed.settings : {};
+    const watchedVideoKeys = getWatchedVideoKeys(settings);
+    const knownVideoKeys = getKnownVideoKeys(settings);
+    const unreadVideoKeys = getUnreadVideoKeys(settings).filter((key) => key !== watchKey);
+    if (!watchedVideoKeys.includes(watchKey)) watchedVideoKeys.push(watchKey);
+    if (!knownVideoKeys.includes(watchKey)) knownVideoKeys.push(watchKey);
+
+    await persistWatchedVideoSettings(fileUuid, canvas, ownerName, ownerNode, parsed, color, {
+      ...settings,
+      knownVideoModelAt: settings.knownVideoModelAt || new Date().toISOString(),
+      knownVideoKeys,
+      unreadVideoKeys,
+      watchedVideoKeys
+    }, retryCount);
+
+    return { knownVideoKeys, unreadVideoKeys, watchedVideoKeys };
+  }
+
+  async function markVideoDiscovered(payload, retryCount = 1) {
+    const { color, fileUuid, ownerName } = parseSharedOptions(payload);
+    const watchKey = String(payload?.watchKey || "").trim();
+    if (!watchKey) return getWatchedVideoState(payload);
+
+    const canvas = await fetchCanvas(fileUuid);
+    const ownerNode = findSharedLikesOwnerNode(canvas.nodes ?? [], ownerName);
+    if (!ownerNode) {
+      throw new Error(`共享画布里找不到名字为「${ownerName}」的文字节点。`);
+    }
+
+    const parsed = parseSharedLikeText(getRawNodeText(ownerNode));
+    const settings = parsed?.settings && typeof parsed.settings === "object" ? parsed.settings : {};
+    const watchedVideoKeys = getWatchedVideoKeys(settings);
+    const knownVideoKeys = getKnownVideoKeys(settings);
+    const unreadVideoKeys = getUnreadVideoKeys(settings);
+    if (!knownVideoKeys.includes(watchKey)) knownVideoKeys.push(watchKey);
+    if (!watchedVideoKeys.includes(watchKey) && !unreadVideoKeys.includes(watchKey)) unreadVideoKeys.push(watchKey);
+
+    await persistWatchedVideoSettings(fileUuid, canvas, ownerName, ownerNode, parsed, color, {
+      ...settings,
+      knownVideoModelAt: settings.knownVideoModelAt || new Date().toISOString(),
+      knownVideoKeys,
+      unreadVideoKeys,
+      watchedVideoKeys
+    }, retryCount);
+
+    return { knownVideoKeys, unreadVideoKeys, watchedVideoKeys };
+  }
+
   async function toggleSharedLike(payload, retryCount = 1) {
     const { color, fileUuid, ownerName } = parseSharedOptions(payload);
     const item = payload?.item;
@@ -1126,6 +1380,8 @@
 
     return {
       annotation: getEagleAnnotation(rawNodes, rawNode ?? {}),
+      assetUuid: getAssetUuid(rawNode?.defaultAsset),
+      downloadCode: buildDownloadCode(rawNode?.defaultAsset, nodeId),
       fileUuid: getCanvasIdentity().fileUuid,
       mediaType: inferAssetMediaType(rawNode?.defaultAsset, url || fallback?.url) || fallback?.mediaType || "",
       name: getNodeLabel(rawNode ?? {}) || fallback?.name || "",
@@ -1166,6 +1422,8 @@
 
     return {
       annotation: getEagleAnnotation(rawNodes, rawNode ?? {}),
+      assetUuid: getAssetUuid(rawNode?.defaultAsset),
+      downloadCode: buildDownloadCode(rawNode?.defaultAsset, nodeId),
       fileUuid: getCanvasIdentity().fileUuid,
       mediaType: inferAssetMediaType(rawNode?.defaultAsset, url || fallback?.url) || fallback?.mediaType || "",
       name: getNodeLabel(rawNode ?? {}) || fallback?.name || "",
@@ -1602,6 +1860,21 @@
 
       if (action === "get-shared-liked-items") {
         respond(requestId, true, await getSharedLikedItems(payload));
+        return;
+      }
+
+      if (action === "get-watched-video-state") {
+        respond(requestId, true, await getWatchedVideoState(payload));
+        return;
+      }
+
+      if (action === "mark-video-watched") {
+        respond(requestId, true, await markVideoWatched(payload));
+        return;
+      }
+
+      if (action === "mark-video-discovered") {
+        respond(requestId, true, await markVideoDiscovered(payload));
         return;
       }
 

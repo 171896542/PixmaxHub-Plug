@@ -2,6 +2,12 @@
 
 const LIKES_STORAGE_KEY = "pixmaxLikedItems";
 const REVIEW_VIDEO_SOUND_KEY = "pixmaxReviewVideoSoundEnabled";
+const WATCHED_VIDEO_STORAGE_KEY = "pixmaxWatchedVideoKeys";
+const KNOWN_VIDEO_STORAGE_KEY = "pixmaxKnownVideoKeys";
+const UNREAD_VIDEO_STORAGE_KEY = "pixmaxUnreadVideoKeys";
+const WATCHED_VIDEO_BASELINE_KEY = "pixmaxWatchedVideoBaselineAt";
+const WATCHED_VIDEO_REVIEW_BASELINE_KEY = "pixmaxWatchedVideoReviewBaselineAt";
+const KNOWN_VIDEO_REVIEW_MODEL_KEY = "pixmaxKnownVideoReviewModelAt";
 const FOCUS_PARAM = "pixmaxClonerFocus";
 const API_ORIGIN = "https://app.pixmax.cn";
 const SHARED_LIKES_MARKER = "PIXMAX_CANVAS_CLONER_LIKES_V1";
@@ -56,6 +62,9 @@ let activeSourceItems = [];
 let activeRenderOptions = {};
 let reviewVideoSoundEnabled = true;
 let expandedMediaPreview = null;
+let watchedVideoKeys = new Set();
+let knownVideoKeys = new Set();
+let unreadVideoKeys = new Set();
 
 init();
 
@@ -116,6 +125,7 @@ function loadLikes() {
         try {
           const result = await getSharedLikedItems(sharedOptions);
           allSharedItems = result.allItems;
+          await initializeSharedWatchedVideoBaseline(result);
           renderOwnerFilters(allSharedItems, sharedOptions.ownerName);
         } catch (error) {
           renderError(error.message || String(error));
@@ -125,10 +135,15 @@ function loadLikes() {
         return;
       }
 
-      chrome.storage.local.get({ [LIKES_STORAGE_KEY]: [] }, (result) => {
+      chrome.storage.local.get({ [LIKES_STORAGE_KEY]: [] }, async (result) => {
         allSharedItems = [];
         renderOwnerFilters([]);
-        setActiveItems(Array.isArray(result[LIKES_STORAGE_KEY]) ? result[LIKES_STORAGE_KEY] : []);
+        const items = Array.isArray(result[LIKES_STORAGE_KEY]) ? result[LIKES_STORAGE_KEY] : [];
+        if (await enrichItemsWithOriginalAssetInfo(items)) {
+          setLocalLikedItems(items).catch(() => {});
+        }
+        await initializeLocalWatchedVideoBaseline(items);
+        setActiveItems(items);
         resolve();
       });
     });
@@ -234,6 +249,11 @@ function matchesSearch(item) {
     item.url,
     item.website,
     item.likedBy,
+    item.assetUuid,
+    item.downloadCode,
+    item.eagleCode,
+    item.nodeId,
+    getItemDownloadCode(item),
     ...(Array.isArray(item.reviewTags) ? item.reviewTags : []),
     ...(Array.isArray(item.socialComments) ? item.socialComments.map((comment) => comment.text) : [])
   ]
@@ -385,9 +405,15 @@ function renderItem(item) {
   const isExpandableMedia = Boolean(mediaUrl && !isAudio);
   const likeColor = normalizeColor(item.likedByColor);
   const likeKey = getLikeKey(item);
+  const downloadCode = getItemDownloadCode(item);
+  const videoWatchKey = getItemVideoWatchKey(item);
 
   card.dataset.likeKey = likeKey;
   card.dataset.likeColor = likeColor;
+  if (videoWatchKey) {
+    card.dataset.watchKey = videoWatchKey;
+    card.classList.toggle("video-unwatched", unreadVideoKeys.has(videoWatchKey));
+  }
   card.style.setProperty("--like-color", likeColor);
   select.checked = selectedLikeKeys.has(likeKey);
   card.addEventListener("click", (event) => {
@@ -425,7 +451,10 @@ function renderItem(item) {
   title.textContent = item.name || filenameFromUrl(mediaUrl) || "Pixmax result";
   prompt.textContent = item.annotation || "No prompt captured.";
   prompt.title = item.annotation || "";
-  meta.textContent = formatLikedAt(item.likedAt, item.likedBy);
+  meta.textContent = downloadCode
+    ? `${formatLikedAt(item.likedAt, item.likedBy)} · ${downloadCode}`
+    : formatLikedAt(item.likedAt, item.likedBy);
+  if (downloadCode) meta.title = `Eagle 下载编码：${downloadCode}`;
   open.href = buildFocusUrl(pageUrl, item.nodeId) || mediaUrl || "#";
   renderReviewPanel(item, card, ribbon);
   if (eagle) {
@@ -766,6 +795,10 @@ function createPreview(item) {
     video.playsInline = true;
     video.preload = "metadata";
     video.dataset.reviewVideo = "true";
+    video.dataset.watchKey = getItemVideoWatchKey(item);
+    video.addEventListener("play", () => {
+      markItemVideoWatched(item).catch(() => {});
+    });
     video.addEventListener("volumechange", () => {
       const enabled = !video.muted && video.volume > 0;
       if (enabled === reviewVideoSoundEnabled) return;
@@ -795,6 +828,188 @@ function createPreview(item) {
 
 function isVideoUrl(url) {
   return /\.(mp4|webm|mov)(\?|#|$)/i.test(String(url || ""));
+}
+
+function isVideoItem(item) {
+  return item?.mediaType === "video" || isVideoUrl(normalizeUrl(item?.url));
+}
+
+function extractVideoWatchKeyFromUrl(value) {
+  const url = String(value || "").trim();
+  if (!url) return "";
+  const resMatch = url.match(/RES-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+  if (resMatch) return `res:${resMatch[0].toLowerCase()}`;
+  try {
+    const parsed = new URL(url);
+    parsed.hash = "";
+    parsed.search = "";
+    return `url:${parsed.href}`;
+  } catch {
+    return `url:${url.split(/[?#]/, 1)[0]}`;
+  }
+}
+
+function getItemVideoWatchKey(item) {
+  if (!isVideoItem(item)) return "";
+  return (
+    extractVideoWatchKeyFromUrl(item.url) ||
+    extractVideoWatchKeyFromUrl(item.previewUrl) ||
+    extractVideoWatchKeyFromUrl(item.poster) ||
+    (getItemDownloadCode(item) ? `code:${getItemDownloadCode(item)}` : "") ||
+    (item.assetUuid ? `asset:${String(item.assetUuid).toLowerCase()}` : "") ||
+    (item.nodeId ? `node:${String(item.nodeId).toLowerCase()}` : "")
+  );
+}
+
+function getWatchedVideoKeys(settings = {}) {
+  const keys = Array.isArray(settings?.watchedVideoKeys) ? settings.watchedVideoKeys : [];
+  return [...new Set(keys.map((key) => String(key || "").trim()).filter(Boolean))];
+}
+
+function getKnownVideoKeys(settings = {}) {
+  const keys = Array.isArray(settings?.knownVideoKeys) ? settings.knownVideoKeys : [];
+  return [...new Set(keys.map((key) => String(key || "").trim()).filter(Boolean))];
+}
+
+function getUnreadVideoKeys(settings = {}) {
+  const keys = Array.isArray(settings?.unreadVideoKeys) ? settings.unreadVideoKeys : [];
+  return [...new Set(keys.map((key) => String(key || "").trim()).filter(Boolean))];
+}
+
+function hasReviewWatchedVideoBaseline(settings = {}) {
+  return Boolean(settings?.knownVideoReviewModelAt);
+}
+
+function getItemVideoWatchKeys(items) {
+  return [
+    ...new Set(
+      (items || [])
+        .map(getItemVideoWatchKey)
+        .filter(Boolean)
+    )
+  ];
+}
+
+async function initializeSharedWatchedVideoBaseline(result) {
+  const settings = result.currentOwnerSettings || {};
+  const watchedKeys = new Set(getWatchedVideoKeys(settings));
+  const knownKeys = new Set(getKnownVideoKeys(settings));
+  const unreadKeys = new Set(getUnreadVideoKeys(settings).filter((key) => !watchedKeys.has(key)));
+  let changed = unreadKeys.size !== getUnreadVideoKeys(settings).length;
+  if (!hasReviewWatchedVideoBaseline(settings)) {
+    unreadKeys.clear();
+    for (const key of getItemVideoWatchKeys(result.allItems)) knownKeys.add(key);
+    watchedVideoKeys = watchedKeys;
+    knownVideoKeys = knownKeys;
+    unreadVideoKeys = unreadKeys;
+    const now = new Date().toISOString();
+    await persistSharedVideoState({
+      ...settings,
+      knownVideoKeys: [...knownKeys],
+      knownVideoReviewModelAt: now,
+      unreadVideoKeys: [...unreadKeys],
+      watchedVideoBaselineAt: settings.watchedVideoBaselineAt || now,
+      watchedVideoReviewBaselineAt: now
+    }).catch(() => {});
+    return;
+  }
+  for (const key of getItemVideoWatchKeys(result.allItems)) {
+    if (knownKeys.has(key)) continue;
+    knownKeys.add(key);
+    if (!watchedKeys.has(key)) unreadKeys.add(key);
+    changed = true;
+  }
+  watchedVideoKeys = watchedKeys;
+  knownVideoKeys = knownKeys;
+  unreadVideoKeys = unreadKeys;
+  if (changed) {
+    persistSharedVideoState({
+      ...settings,
+      knownVideoKeys: [...knownKeys],
+      knownVideoReviewModelAt: settings.knownVideoReviewModelAt || new Date().toISOString(),
+      unreadVideoKeys: [...unreadKeys],
+      watchedVideoKeys: [...watchedKeys]
+    }).catch(() => {});
+  }
+}
+
+async function initializeLocalWatchedVideoBaseline(items) {
+  const { knownKeys, reviewModelAt, unreadKeys, watchedKeys } = await getLocalWatchedVideoState();
+  const nextKnownKeys = new Set(knownKeys);
+  const nextUnreadKeys = new Set(unreadKeys.filter((key) => !watchedKeys.includes(key)));
+  let changed = nextUnreadKeys.size !== unreadKeys.length;
+  if (!reviewModelAt) {
+    nextUnreadKeys.clear();
+    for (const key of getItemVideoWatchKeys(items)) nextKnownKeys.add(key);
+    watchedVideoKeys = new Set(watchedKeys);
+    knownVideoKeys = nextKnownKeys;
+    unreadVideoKeys = nextUnreadKeys;
+    const now = new Date().toISOString();
+    await setLocalWatchedVideoState({
+      knownKeys: [...nextKnownKeys],
+      reviewModelAt: now,
+      reviewBaselineAt: now,
+      baselineAt: now,
+      unreadKeys: [...nextUnreadKeys],
+      watchedKeys
+    }).catch(() => {});
+    return;
+  }
+  for (const key of getItemVideoWatchKeys(items)) {
+    if (nextKnownKeys.has(key)) continue;
+    nextKnownKeys.add(key);
+    if (!watchedKeys.includes(key)) nextUnreadKeys.add(key);
+    changed = true;
+  }
+  watchedVideoKeys = new Set(watchedKeys);
+  knownVideoKeys = nextKnownKeys;
+  unreadVideoKeys = nextUnreadKeys;
+  if (changed) {
+    setLocalWatchedVideoState({
+      knownKeys: [...nextKnownKeys],
+      reviewModelAt,
+      reviewBaselineAt: reviewModelAt,
+      unreadKeys: [...nextUnreadKeys],
+      watchedKeys
+    }).catch(() => {});
+  }
+}
+
+async function markItemVideoWatched(item) {
+  const watchKey = getItemVideoWatchKey(item);
+  if (!watchKey) return;
+  if (watchedVideoKeys.has(watchKey) && !unreadVideoKeys.has(watchKey)) return;
+  watchedVideoKeys.add(watchKey);
+  knownVideoKeys.add(watchKey);
+  unreadVideoKeys.delete(watchKey);
+  syncRenderedVideoWatchState(watchKey);
+  if (sharedMode && sharedOptions?.enabled) {
+    await persistSharedVideoState({
+      knownVideoKeys: [...knownVideoKeys],
+      unreadVideoKeys: [...unreadVideoKeys],
+      watchedVideoKeys: [...watchedVideoKeys]
+    });
+  } else {
+    const state = await getLocalWatchedVideoState();
+    const now = new Date().toISOString();
+    await setLocalWatchedVideoState({
+      ...state,
+      baselineAt: state.baselineAt || now,
+      knownKeys: [...knownVideoKeys],
+      reviewModelAt: state.reviewModelAt || now,
+      reviewBaselineAt: state.reviewBaselineAt || now,
+      unreadKeys: [...unreadVideoKeys],
+      watchedKeys: [...watchedVideoKeys]
+    });
+  }
+}
+
+function syncRenderedVideoWatchState(changedKey = "") {
+  for (const card of grid.querySelectorAll(".card[data-watch-key]")) {
+    const watchKey = card.dataset.watchKey || "";
+    if (changedKey && watchKey !== changedKey) continue;
+    card.classList.toggle("video-unwatched", Boolean(watchKey && unreadVideoKeys.has(watchKey)));
+  }
 }
 
 function isAudioUrl(url) {
@@ -1085,6 +1300,12 @@ async function fetchSharedCanvas() {
   return result.data;
 }
 
+async function fetchCanvas(fileUuid) {
+  const result = await apiPost("/canvas/get", { fileUuid });
+  if (!result.success) throw new Error(result.errMessage || result.errCode || "Could not read canvas.");
+  return result.data;
+}
+
 function parseSharedLikeText(value) {
   const text = String(value || "");
   const markerIndex = text.indexOf(SHARED_LIKES_MARKER);
@@ -1217,6 +1438,119 @@ function getRawNodeText(rawNode) {
 
 function isTextLikeNode(rawNode) {
   return typeof rawNode?.nodeText === "string";
+}
+
+function compactId(value, length = 12) {
+  return String(value || "").replace(/[^0-9a-z]/gi, "").slice(0, length);
+}
+
+function getAssetUuidFromNode(rawNode) {
+  return String(
+    rawNode?.defaultAsset?.assetsUuid ||
+      rawNode?.defaultAsset?.assetUuid ||
+      rawNode?.defaultAsset?.uuid ||
+      rawNode?.defaultAsset?.id ||
+      ""
+  ).trim();
+}
+
+function buildDownloadCode(assetUuid, nodeId) {
+  const assetCode = compactId(assetUuid);
+  const nodeCode = compactId(nodeId);
+  return assetCode && nodeCode ? `${assetCode}-${nodeCode}` : "";
+}
+
+function getItemDownloadCode(item) {
+  const explicitCode = String(item?.downloadCode || item?.eagleCode || "").trim();
+  if (/^[0-9a-z]{12}-[0-9a-z]{12}$/i.test(explicitCode)) return explicitCode;
+  return buildDownloadCode(item?.assetUuid, item?.nodeId);
+}
+
+function buildAssetInfoByNodeId(nodes) {
+  const map = new Map();
+  for (const node of nodes || []) {
+    const assetUuid = getAssetUuidFromNode(node);
+    if (!assetUuid || !node?.uuid) continue;
+    map.set(node.uuid, {
+      assetUuid,
+      downloadCode: buildDownloadCode(assetUuid, node.uuid),
+      mediaType: inferNodeMediaType(node)
+    });
+  }
+  return map;
+}
+
+function inferNodeMediaType(node) {
+  const asset = node?.defaultAsset || {};
+  const fields = [
+    asset.fileType,
+    asset.type,
+    asset.mimeType,
+    asset.mime,
+    asset.contentType,
+    asset.mediaType,
+    asset.name,
+    asset.fileName,
+    asset.filename,
+    asset.webUrl,
+    asset.relativePath
+  ].map((value) => String(value || "").toLowerCase());
+  if (fields.some((value) => /video|\.mp4|\.webm|\.mov|\.m4v|\.avi|\.mkv/.test(value))) return "video";
+  if (fields.some((value) => /audio|\.mp3|\.wav|\.m4a|\.aac|\.ogg/.test(value))) return "audio";
+  if (fields.some((value) => /image|\.png|\.jpe?g|\.webp|\.gif|\.avif|\.bmp/.test(value))) return "image";
+  return "";
+}
+
+function enrichItemWithAssetInfo(item, assetInfoByNodeId) {
+  const info = assetInfoByNodeId.get(item?.nodeId);
+  if (!info) return item;
+  return {
+    ...item,
+    assetUuid: item.assetUuid || info.assetUuid,
+    downloadCode: item.downloadCode || info.downloadCode,
+    mediaType: item.mediaType || info.mediaType
+  };
+}
+
+async function enrichItemsWithOriginalAssetInfo(items) {
+  const pendingByFileUuid = new Map();
+  let changed = false;
+  for (const item of items || []) {
+    if (getItemDownloadCode(item)) continue;
+    const fileUuid = String(item?.fileUuid || "").trim();
+    const nodeId = String(item?.nodeId || "").trim();
+    if (!fileUuid || !nodeId) continue;
+    if (!pendingByFileUuid.has(fileUuid)) pendingByFileUuid.set(fileUuid, []);
+    pendingByFileUuid.get(fileUuid).push(item);
+  }
+
+  await Promise.all(
+    [...pendingByFileUuid.entries()].map(async ([fileUuid, fileItems]) => {
+      try {
+        const canvas = await fetchCanvas(fileUuid);
+        const assetInfoByNodeId = buildAssetInfoByNodeId(canvas.nodes ?? []);
+        for (const item of fileItems) {
+          const info = assetInfoByNodeId.get(item.nodeId);
+          if (!info) continue;
+          if (!item.assetUuid && info.assetUuid) {
+            item.assetUuid = info.assetUuid;
+            changed = true;
+          }
+          if (!item.downloadCode && info.downloadCode) {
+            item.downloadCode = info.downloadCode;
+            changed = true;
+          }
+          if (!item.mediaType && info.mediaType) {
+            item.mediaType = info.mediaType;
+            changed = true;
+          }
+        }
+      } catch {
+        // Some source canvases may be unavailable; keep the review board usable.
+      }
+    })
+  );
+  return changed;
 }
 
 function findSharedLikesOwnerNode(nodes, ownerName) {
@@ -1398,7 +1732,10 @@ function buildLikeIndexNode(nodes, ownerName, data) {
 function getSharedLikesFromCanvas(canvas, ownerName) {
   const allItems = [];
   let ownItems = [];
+  let currentOwnerSettings = {};
   const ownerColors = new Map();
+  const ownerRecords = [];
+  const assetInfoByNodeId = buildAssetInfoByNodeId(canvas.nodes ?? []);
   let socialData = normalizeSocialData();
 
   for (const node of canvas.nodes ?? []) {
@@ -1408,9 +1745,21 @@ function getSharedLikesFromCanvas(canvas, ownerName) {
       const likedBy = parsed.ownerName || getRawNodeLabel(node) || "Unknown";
       const likedByColor = normalizeColor(parsed.color);
       ownerColors.set(likedBy, likedByColor);
-      const items = parsed.items.map((item) => ({ ...item, likedBy, likedByColor }));
+      const items = parsed.items.map((item) =>
+        enrichItemWithAssetInfo({ ...item, likedBy, likedByColor }, assetInfoByNodeId)
+      );
+      ownerRecords.push({
+        color: likedByColor,
+        items,
+        node,
+        ownerName: likedBy,
+        settings: parsed.settings || {}
+      });
       allItems.push(...items);
-      if (likedBy === ownerName) ownItems = items;
+      if (likedBy === ownerName) {
+        ownItems = items;
+        currentOwnerSettings = parsed.settings || {};
+      }
       continue;
     }
 
@@ -1422,6 +1771,8 @@ function getSharedLikesFromCanvas(canvas, ownerName) {
   return {
     allItems: attachSocialData(allItems, socialData, ownerName, ownerColors),
     ownItems,
+    currentOwnerSettings,
+    ownerRecords,
     socialData
   };
 }
@@ -1514,7 +1865,72 @@ function getSocialEntryTargetId(entry) {
 async function getSharedLikedItems(options) {
   sharedOptions = options;
   const canvas = await fetchSharedCanvas();
-  return getSharedLikesFromCanvas(canvas, options.ownerName);
+  const result = getSharedLikesFromCanvas(canvas, options.ownerName);
+  const changedRecords = [];
+  await Promise.all(
+    result.ownerRecords.map(async (record) => {
+      const changed = await enrichItemsWithOriginalAssetInfo(record.items);
+      if (changed) changedRecords.push(record);
+    })
+  );
+  if (changedRecords.length) {
+    persistEnrichedSharedItems(canvas, changedRecords).catch(() => {});
+  }
+  return result;
+}
+
+async function persistEnrichedSharedItems(canvas, records, retryCount = 1) {
+  const update = records.map((record) => ({
+    uuid: record.node.uuid,
+    metaData: record.node.metaData || "{}",
+    nodeText: buildSharedLikeText(
+      record.ownerName,
+      stripRuntimeFields(record.items),
+      record.color,
+      record.settings
+    )
+  }));
+  if (!update.length) return;
+
+  const result = await apiPost("/canvas/node/batch", {
+    fileUuid: sharedOptions.fileUuid,
+    baseRevision: canvas.revision,
+    create: [],
+    update,
+    delete: []
+  });
+
+  if (!result.success) {
+    if (result.errCode === CANVAS_REVISION_CONFLICT && retryCount > 0) {
+      const nextCanvas = await fetchSharedCanvas();
+      const nextRecords = records
+        .map((record) => {
+          const node = findSharedLikesOwnerNode(nextCanvas.nodes ?? [], record.ownerName);
+          return node ? { ...record, node } : null;
+        })
+        .filter(Boolean);
+      return persistEnrichedSharedItems(nextCanvas, nextRecords, retryCount - 1);
+    }
+    throw new Error(result.errMessage || result.errCode || "Could not persist Eagle codes.");
+  }
+}
+
+function stripRuntimeFields(items) {
+  return (items || []).map((item) => {
+    const {
+      likedBy,
+      likedByColor,
+      reviewStatus,
+      reviewTags,
+      reviewByMe,
+      reviews,
+      socialComments,
+      socialLikedByMe,
+      socialLikes,
+      ...storedItem
+    } = item;
+    return storedItem;
+  });
 }
 
 async function saveSharedOwnItems(items, retryCount = 1) {
@@ -1838,6 +2254,125 @@ function setLocalLikedItems(items) {
       else resolve();
     });
   });
+}
+
+function getLocalWatchedVideoKeys() {
+  return getLocalWatchedVideoState().then((state) => state.watchedKeys);
+}
+
+function getLocalWatchedVideoState() {
+  return new Promise((resolve, reject) => {
+    chrome.storage.local.get(
+      {
+        [KNOWN_VIDEO_STORAGE_KEY]: [],
+        [UNREAD_VIDEO_STORAGE_KEY]: [],
+        [WATCHED_VIDEO_STORAGE_KEY]: [],
+        [WATCHED_VIDEO_BASELINE_KEY]: "",
+        [WATCHED_VIDEO_REVIEW_BASELINE_KEY]: "",
+        [KNOWN_VIDEO_REVIEW_MODEL_KEY]: ""
+      },
+      (result) => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          reject(new Error(runtimeError.message));
+          return;
+        }
+        const watchedKeys = getWatchedVideoKeys({ watchedVideoKeys: result[WATCHED_VIDEO_STORAGE_KEY] });
+        resolve({
+          baselineAt: String(result[WATCHED_VIDEO_BASELINE_KEY] || ""),
+          knownKeys: getKnownVideoKeys({ knownVideoKeys: result[KNOWN_VIDEO_STORAGE_KEY] }),
+          reviewBaselineAt: String(result[WATCHED_VIDEO_REVIEW_BASELINE_KEY] || ""),
+          reviewModelAt: String(result[KNOWN_VIDEO_REVIEW_MODEL_KEY] || ""),
+          unreadKeys: getUnreadVideoKeys({ unreadVideoKeys: result[UNREAD_VIDEO_STORAGE_KEY] }).filter(
+            (key) => !watchedKeys.includes(key)
+          ),
+          watchedKeys
+        });
+      }
+    );
+  });
+}
+
+function setLocalWatchedVideoState(state = {}) {
+  return new Promise((resolve, reject) => {
+    chrome.storage.local.set(
+      {
+        [KNOWN_VIDEO_STORAGE_KEY]: getKnownVideoKeys({ knownVideoKeys: state.knownKeys }),
+        [UNREAD_VIDEO_STORAGE_KEY]: getUnreadVideoKeys({ unreadVideoKeys: state.unreadKeys }),
+        [WATCHED_VIDEO_STORAGE_KEY]: getWatchedVideoKeys({ watchedVideoKeys: state.watchedKeys }),
+        [WATCHED_VIDEO_BASELINE_KEY]: state.baselineAt || "",
+        [WATCHED_VIDEO_REVIEW_BASELINE_KEY]: state.reviewBaselineAt || "",
+        [KNOWN_VIDEO_REVIEW_MODEL_KEY]: state.reviewModelAt || ""
+      },
+      () => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) reject(new Error(runtimeError.message));
+        else resolve();
+      }
+    );
+  });
+}
+
+async function persistSharedVideoState(nextSettings = null, retryCount = 1) {
+  const canvas = await fetchSharedCanvas();
+  const ownerNode = findSharedLikesOwnerNode(canvas.nodes ?? [], sharedOptions.ownerName);
+  if (!ownerNode) throw new Error(`Shared canvas has no text node named "${sharedOptions.ownerName}".`);
+  const parsed = parseSharedLikeText(getRawNodeText(ownerNode));
+  const settings = parsed?.settings && typeof parsed.settings === "object" ? parsed.settings : {};
+  const mergedWatchedKeys = getWatchedVideoKeys({
+    watchedVideoKeys: [
+      ...getWatchedVideoKeys(settings),
+      ...getWatchedVideoKeys(nextSettings)
+    ]
+  });
+  const mergedSettings = {
+    ...settings,
+    ...(nextSettings || {}),
+    watchedVideoBaselineAt:
+      nextSettings?.watchedVideoBaselineAt || settings.watchedVideoBaselineAt || new Date().toISOString(),
+    watchedVideoReviewBaselineAt:
+      nextSettings?.watchedVideoReviewBaselineAt || settings.watchedVideoReviewBaselineAt || "",
+    knownVideoReviewModelAt:
+      nextSettings?.knownVideoReviewModelAt || settings.knownVideoReviewModelAt || "",
+    knownVideoKeys: getKnownVideoKeys({
+      knownVideoKeys: [
+        ...getKnownVideoKeys(settings),
+        ...getKnownVideoKeys(nextSettings)
+      ]
+    }),
+    unreadVideoKeys: getUnreadVideoKeys({
+      unreadVideoKeys: [
+        ...getUnreadVideoKeys(settings),
+        ...getUnreadVideoKeys(nextSettings)
+      ]
+    }).filter((key) => !mergedWatchedKeys.includes(key)),
+    watchedVideoKeys: mergedWatchedKeys
+  };
+  const result = await apiPost("/canvas/node/batch", {
+    fileUuid: sharedOptions.fileUuid,
+    baseRevision: canvas.revision,
+    create: [],
+    update: [
+      {
+        uuid: ownerNode.uuid,
+        metaData: ownerNode.metaData || "{}",
+        nodeText: buildSharedLikeText(
+          sharedOptions.ownerName,
+          parsed?.items || [],
+          sharedOptions.color || parsed?.color,
+          mergedSettings
+        )
+      }
+    ],
+    delete: []
+  });
+
+  if (!result.success) {
+    if (result.errCode === CANVAS_REVISION_CONFLICT && retryCount > 0) {
+      return persistSharedVideoState(nextSettings, retryCount - 1);
+    }
+    throw new Error(result.errMessage || result.errCode || "Could not update watched videos.");
+  }
 }
 
 function parseTags(value) {

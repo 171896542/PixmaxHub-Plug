@@ -167,7 +167,8 @@ function filenameFromUrl(value) {
 function buildEagleItemName(item, url) {
   const baseName = sanitizeFilename(item?.name || filenameFromUrl(url) || "pixmax-asset");
   if (!isVideoAsset(item, url)) return baseName;
-  return appendTimestampToName(baseName);
+  const downloadCode = getDownloadCode(item);
+  return downloadCode ? appendCodeToName(baseName, downloadCode) : baseName;
 }
 
 function isVideoAsset(item, url) {
@@ -186,26 +187,30 @@ function isVideoAsset(item, url) {
   return /(^|\b)video(\b|\/)|视频|\.mp4(\?|#|$)|\.webm(\?|#|$)|\.mov(\?|#|$)|\.m4v(\?|#|$)|\.avi(\?|#|$)|\.mkv(\?|#|$)/i.test(haystack);
 }
 
-function appendTimestampToName(name) {
-  const timestamp = formatTimestamp(new Date());
-  const dotIndex = name.lastIndexOf(".");
-  if (dotIndex > 0 && dotIndex < name.length - 1) {
-    return `${name.slice(0, dotIndex)} ${timestamp}${name.slice(dotIndex)}`;
-  }
-  return `${name} ${timestamp}`;
+function getDownloadCode(item) {
+  const explicitCode = sanitizeCode(item?.downloadCode || item?.eagleCode);
+  if (explicitCode) return explicitCode;
+  const assetCode = compactId(item?.assetUuid);
+  const nodeCode = compactId(item?.nodeId);
+  return assetCode && nodeCode ? `${assetCode}-${nodeCode}` : assetCode || nodeCode;
 }
 
-function formatTimestamp(date) {
-  const pad = (value) => String(value).padStart(2, "0");
-  return [
-    date.getFullYear(),
-    pad(date.getMonth() + 1),
-    pad(date.getDate()),
-    "-",
-    pad(date.getHours()),
-    pad(date.getMinutes()),
-    pad(date.getSeconds())
-  ].join("");
+function sanitizeCode(value) {
+  const text = String(value || "").trim();
+  return /^[0-9a-z]{12}-[0-9a-z]{12}$/i.test(text) ? text : "";
+}
+
+function compactId(value, length = 12) {
+  return String(value || "").replace(/[^0-9a-z]/gi, "").slice(0, length);
+}
+
+function appendCodeToName(name, code) {
+  if (name.includes(code)) return name;
+  const dotIndex = name.lastIndexOf(".");
+  if (dotIndex > 0 && dotIndex < name.length - 1) {
+    return `${name.slice(0, dotIndex)} ${code}${name.slice(dotIndex)}`;
+  }
+  return `${name} ${code}`;
 }
 
 function sanitizeFilename(value) {

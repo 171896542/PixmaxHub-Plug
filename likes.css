@@ -249,6 +249,21 @@ body.multi-select .card {
   position: relative;
 }
 
+.card.video-unwatched .preview-wrap::before {
+  content: "";
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 2;
+  width: 12px;
+  height: 12px;
+  border: 2px solid #0f1012;
+  border-radius: 999px;
+  background: #ffd500;
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 72%), 0 6px 14px rgb(0 0 0 / 42%);
+  pointer-events: none;
+}
+
 .review-ribbon {
   position: absolute;
   left: 10px;

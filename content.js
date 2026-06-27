@@ -15,12 +15,15 @@
   const OFFICIAL_FOCUS_STYLE_ID = "collab-remote-focus-styles";
   const LIVE_FOCUS_STYLE_ID = "pixmax-canvas-cloner-live-focus-colors";
   const LIVE_SELECTION_STYLE_ID = "pixmax-canvas-cloner-live-selection-color";
-  const STYLE_VERSION = "1.4.7";
+  const STYLE_VERSION = "1.4.8";
   const TOAST_ID = "pixmax-canvas-cloner-toast";
   const LIVE_TOGGLE_ID = "pixmax-canvas-cloner-live-toggle";
   const OPEN_LIKES_BUTTON_ID = "pixmax-canvas-cloner-open-likes";
   const LIVE_CURSOR_LAYER_ID = "pixmax-canvas-cloner-live-cursors";
   const LIKES_STORAGE_KEY = "pixmaxLikedItems";
+  const WATCHED_VIDEO_STORAGE_KEY = "pixmaxWatchedVideoKeys";
+  const WATCHED_VIDEO_CANVAS_BASELINES_KEY = "pixmaxWatchedVideoCanvasBaselines";
+  const KNOWN_VIDEO_CANVAS_MODEL_KEY = "pixmaxKnownVideoCanvasModelAt";
   const LIVE_IDENTITY_STORAGE_KEY = "pixmaxHubLiveIdentity";
   const UPDATE_CHECK_STORAGE_KEY = "pixmaxHubUpdateReminder";
   const DEFAULT_GITHUB_UPDATE_URL = "https://github.com/171896542/PixmaxHub-Plug/tree/main";
@@ -59,6 +62,11 @@
   let likedKeys = new Set();
   let ownLikedKeys = new Set();
   let likedColors = new Map();
+  let watchedVideoKeys = new Set();
+  let knownVideoKeys = new Set();
+  let unreadVideoKeys = new Set();
+  let watchedVideoOptions = null;
+  let videoWatchStateReady = false;
   let toolbarSyncScheduled = false;
   let contextPasteSyncScheduled = false;
   let legacyCleanupScheduled = false;
@@ -285,6 +293,21 @@
         background: var(--pixmax-cloner-like-color, #ff3864);
         color: #fff;
         font: 16px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        pointer-events: none;
+      }
+      ${NODE_SELECTOR}.pixmax-canvas-cloner-unwatched-video::before {
+        content: "";
+        position: absolute;
+        top: -7px;
+        left: -7px;
+        z-index: 6;
+        display: block;
+        width: 14px;
+        height: 14px;
+        border: 2px solid #0f1012;
+        border-radius: 999px;
+        background: #ffd500;
+        box-shadow: 0 0 0 1px rgb(255 255 255 / 72%), 0 6px 14px rgb(0 0 0 / 42%);
         pointer-events: none;
       }
       ${NODE_SELECTOR}.pixmax-canvas-cloner-focus {
@@ -699,8 +722,222 @@
       color: normalizeColor(options.sharedLikesColor),
       enabled: Boolean(options.sharedLikesEnabled && fileUuid && ownerName),
       fileUuid,
-      ownerName
+      ownerName,
+      sourceFileUuid: getCurrentFileUuid()
     };
+  }
+
+  function normalizeWatchedVideoKeys(value) {
+    return [
+      ...new Set(
+        (Array.isArray(value) ? value : [])
+          .map((key) => String(key || "").trim())
+          .filter(Boolean)
+      )
+    ];
+  }
+
+  function normalizeWatchedVideoCanvasBaselines(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+    return Object.fromEntries(
+      Object.entries(value)
+        .map(([key, timestamp]) => [String(key || "").trim(), String(timestamp || "").trim()])
+        .filter(([key, timestamp]) => key && timestamp)
+    );
+  }
+
+  function extractVideoWatchKeyFromUrl(value) {
+    const url = String(value || "").trim();
+    if (!url) return "";
+    const resMatch = url.match(/RES-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+    if (resMatch) return `res:${resMatch[0].toLowerCase()}`;
+    try {
+      const parsed = new URL(url, location.href);
+      parsed.hash = "";
+      parsed.search = "";
+      return `url:${parsed.href}`;
+    } catch {
+      return `url:${url.split(/[?#]/, 1)[0]}`;
+    }
+  }
+
+  function getElementVideoWatchKey(video) {
+    if (!video) return "";
+    const directUrl = video.currentSrc || video.src || video.getAttribute?.("src") || "";
+    const key = extractVideoWatchKeyFromUrl(directUrl);
+    if (key) return key;
+    for (const source of video.querySelectorAll?.("source") ?? []) {
+      const sourceKey = extractVideoWatchKeyFromUrl(source.currentSrc || source.src || source.getAttribute("src"));
+      if (sourceKey) return sourceKey;
+    }
+    return "";
+  }
+
+  function getNodeVideoWatchKey(node) {
+    if (!node) return "";
+    for (const video of node.querySelectorAll?.("video") ?? []) {
+      const key = getElementVideoWatchKey(video);
+      if (key) return key;
+    }
+    return "";
+  }
+
+  function applyNodeUnwatchedVideoState(node) {
+    if (!node) return;
+    const watchKey = getNodeVideoWatchKey(node);
+    if (videoWatchStateReady && watchKey && !knownVideoKeys.has(watchKey)) {
+      markVideoDiscovered(watchKey);
+    }
+    const unwatched = Boolean(watchKey && unreadVideoKeys.has(watchKey));
+    node.classList.toggle("pixmax-canvas-cloner-unwatched-video", unwatched);
+    if (unwatched) node.dataset.pixmaxClonerWatchKey = watchKey;
+    else delete node.dataset.pixmaxClonerWatchKey;
+  }
+
+  function applyVisibleUnwatchedVideoMarks() {
+    for (const node of document.querySelectorAll(NODE_SELECTOR)) {
+      applyNodeUnwatchedVideoState(node);
+    }
+  }
+
+  function getVisibleVideoWatchKeys() {
+    return [
+      ...new Set(
+        [...document.querySelectorAll(NODE_SELECTOR)]
+          .map(getNodeVideoWatchKey)
+          .filter(Boolean)
+      )
+    ];
+  }
+
+  function applyUnwatchedVideoMarksInRoot(root) {
+    if (!root || root.nodeType !== Node.ELEMENT_NODE) return;
+    if (root.matches?.(NODE_SELECTOR)) applyNodeUnwatchedVideoState(root);
+    for (const node of root.querySelectorAll?.(NODE_SELECTOR) ?? []) {
+      applyNodeUnwatchedVideoState(node);
+    }
+    const parentNode = root.closest?.(NODE_SELECTOR);
+    if (parentNode) applyNodeUnwatchedVideoState(parentNode);
+  }
+
+  async function refreshWatchedVideoState() {
+    videoWatchStateReady = false;
+    try {
+      watchedVideoOptions = await getSharedLikeOptions();
+      if (watchedVideoOptions.enabled) {
+        const result = await requestBridge("get-watched-video-state", watchedVideoOptions, 8000);
+        watchedVideoKeys = new Set(normalizeWatchedVideoKeys(result?.watchedVideoKeys));
+        knownVideoKeys = new Set(normalizeWatchedVideoKeys(result?.knownVideoKeys));
+        unreadVideoKeys = new Set(normalizeWatchedVideoKeys(result?.unreadVideoKeys));
+      } else {
+        const result = await storageGet({
+          [WATCHED_VIDEO_STORAGE_KEY]: [],
+          pixmaxKnownVideoKeys: [],
+          pixmaxUnreadVideoKeys: [],
+          [WATCHED_VIDEO_CANVAS_BASELINES_KEY]: {},
+          [KNOWN_VIDEO_CANVAS_MODEL_KEY]: ""
+        });
+        const baselines = normalizeWatchedVideoCanvasBaselines(result[WATCHED_VIDEO_CANVAS_BASELINES_KEY]);
+        const hasKnownModel = Boolean(result[KNOWN_VIDEO_CANVAS_MODEL_KEY]);
+        const canvasKey = getCurrentFileUuid() || location.pathname;
+        const nextWatchedKeys = new Set(normalizeWatchedVideoKeys(result[WATCHED_VIDEO_STORAGE_KEY]));
+        const nextKnownKeys = new Set(normalizeWatchedVideoKeys(result.pixmaxKnownVideoKeys));
+        const nextUnreadKeys = new Set(normalizeWatchedVideoKeys(result.pixmaxUnreadVideoKeys));
+        if (!hasKnownModel || (canvasKey && !baselines[canvasKey])) {
+          if (!hasKnownModel) nextUnreadKeys.clear();
+          for (const key of getVisibleVideoWatchKeys()) nextKnownKeys.add(key);
+          if (canvasKey) baselines[canvasKey] = new Date().toISOString();
+          storageSet({
+            [KNOWN_VIDEO_CANVAS_MODEL_KEY]: result[KNOWN_VIDEO_CANVAS_MODEL_KEY] || new Date().toISOString(),
+            pixmaxKnownVideoKeys: [...nextKnownKeys],
+            [WATCHED_VIDEO_CANVAS_BASELINES_KEY]: baselines
+          }).catch(() => {});
+        } else {
+          for (const key of getVisibleVideoWatchKeys()) {
+            if (nextKnownKeys.has(key)) continue;
+            nextKnownKeys.add(key);
+            if (!nextWatchedKeys.has(key)) nextUnreadKeys.add(key);
+          }
+          storageSet({
+            pixmaxKnownVideoKeys: [...nextKnownKeys],
+            pixmaxUnreadVideoKeys: [...nextUnreadKeys]
+          }).catch(() => {});
+        }
+        watchedVideoKeys = nextWatchedKeys;
+        knownVideoKeys = nextKnownKeys;
+        unreadVideoKeys = nextUnreadKeys;
+      }
+      videoWatchStateReady = true;
+      applyVisibleUnwatchedVideoMarks();
+    } catch {
+      videoWatchStateReady = true;
+      applyVisibleUnwatchedVideoMarks();
+    }
+  }
+
+  function markVideoWatched(watchKey) {
+    if (!watchKey) return;
+    if (watchedVideoKeys.has(watchKey) && !unreadVideoKeys.has(watchKey)) return;
+    watchedVideoKeys.add(watchKey);
+    knownVideoKeys.add(watchKey);
+    unreadVideoKeys.delete(watchKey);
+    applyVisibleUnwatchedVideoMarks();
+    if (watchedVideoOptions?.enabled) {
+      requestBridge("mark-video-watched", { ...watchedVideoOptions, watchKey }, 8000)
+        .then((result) => {
+          if (result?.watchedVideoKeys) {
+            watchedVideoKeys = new Set(normalizeWatchedVideoKeys(result.watchedVideoKeys));
+            knownVideoKeys = new Set(normalizeWatchedVideoKeys(result.knownVideoKeys));
+            unreadVideoKeys = new Set(normalizeWatchedVideoKeys(result.unreadVideoKeys));
+            applyVisibleUnwatchedVideoMarks();
+          }
+        })
+        .catch(() => {});
+      return;
+    }
+    storageSet({
+      [KNOWN_VIDEO_CANVAS_MODEL_KEY]: new Date().toISOString(),
+      [WATCHED_VIDEO_STORAGE_KEY]: [...watchedVideoKeys],
+      pixmaxKnownVideoKeys: [...knownVideoKeys],
+      pixmaxUnreadVideoKeys: [...unreadVideoKeys]
+    }).catch(() => {});
+  }
+
+  function markVideoDiscovered(watchKey) {
+    if (!watchKey || knownVideoKeys.has(watchKey)) return;
+    knownVideoKeys.add(watchKey);
+    if (!watchedVideoKeys.has(watchKey)) unreadVideoKeys.add(watchKey);
+    if (watchedVideoOptions?.enabled) {
+      requestBridge("mark-video-discovered", { ...watchedVideoOptions, watchKey }, 8000)
+        .then((result) => {
+          if (result?.knownVideoKeys) {
+            watchedVideoKeys = new Set(normalizeWatchedVideoKeys(result.watchedVideoKeys));
+            knownVideoKeys = new Set(normalizeWatchedVideoKeys(result.knownVideoKeys));
+            unreadVideoKeys = new Set(normalizeWatchedVideoKeys(result.unreadVideoKeys));
+            applyVisibleUnwatchedVideoMarks();
+          }
+        })
+        .catch(() => {});
+      return;
+    }
+    storageSet({
+      [KNOWN_VIDEO_CANVAS_MODEL_KEY]: new Date().toISOString(),
+      pixmaxKnownVideoKeys: [...knownVideoKeys],
+      pixmaxUnreadVideoKeys: [...unreadVideoKeys]
+    }).catch(() => {});
+  }
+
+  function handleVideoPlay(event) {
+    const video = event.target;
+    if (!video || String(video.tagName || "").toLowerCase() !== "video") return;
+    const watchKey = getElementVideoWatchKey(video) || getNodeVideoWatchKey(video.closest?.(NODE_SELECTOR));
+    markVideoWatched(watchKey);
+  }
+
+  function handleVideoMetadata(event) {
+    const video = event.target;
+    if (!video || String(video.tagName || "").toLowerCase() !== "video") return;
+    applyNodeUnwatchedVideoState(video.closest?.(NODE_SELECTOR));
   }
 
   function getCurrentFileUuid() {
@@ -2118,6 +2355,7 @@
         likedKeys.has(node.dataset.id),
         likedColors.get(node.dataset.id)
       );
+      applyNodeUnwatchedVideoState(node);
     }
     for (const toolbar of document.querySelectorAll(TOOLBAR_SELECTOR)) {
       applyToolbarLikedState(toolbar);
@@ -2133,6 +2371,7 @@
         likedKeys.has(root.dataset.id),
         likedColors.get(root.dataset.id)
       );
+      applyNodeUnwatchedVideoState(root);
     }
 
     for (const node of root.querySelectorAll?.(NODE_SELECTOR) ?? []) {
@@ -2141,6 +2380,7 @@
         likedKeys.has(node.dataset.id),
         likedColors.get(node.dataset.id)
       );
+      applyNodeUnwatchedVideoState(node);
     }
 
     const parentNode = root.closest?.(NODE_SELECTOR);
@@ -2150,6 +2390,7 @@
         likedKeys.has(parentNode.dataset.id),
         likedColors.get(parentNode.dataset.id)
       );
+      applyNodeUnwatchedVideoState(parentNode);
     }
   }
 
@@ -2647,6 +2888,19 @@
         likedColors = buildColorMap({ allItems: items });
         applyVisibleLikedMarks();
       }
+      if (areaName === "local" && changes[WATCHED_VIDEO_STORAGE_KEY]) {
+        watchedVideoKeys = new Set(normalizeWatchedVideoKeys(changes[WATCHED_VIDEO_STORAGE_KEY].newValue));
+        applyVisibleUnwatchedVideoMarks();
+      }
+      if (areaName === "local" && (changes.pixmaxKnownVideoKeys || changes.pixmaxUnreadVideoKeys)) {
+        if (changes.pixmaxKnownVideoKeys) {
+          knownVideoKeys = new Set(normalizeWatchedVideoKeys(changes.pixmaxKnownVideoKeys.newValue));
+        }
+        if (changes.pixmaxUnreadVideoKeys) {
+          unreadVideoKeys = new Set(normalizeWatchedVideoKeys(changes.pixmaxUnreadVideoKeys.newValue));
+        }
+        applyVisibleUnwatchedVideoMarks();
+      }
       if (
         areaName === "sync" &&
         (changes.sharedLikesEnabled ||
@@ -2655,6 +2909,7 @@
           changes.sharedLikesColor)
       ) {
         refreshLikedState();
+        refreshWatchedVideoState();
       }
       if (
         areaName === "sync" &&
@@ -2664,6 +2919,13 @@
       }
     });
     scheduleToolbarSync(document.body);
+    refreshWatchedVideoState();
+    document.addEventListener("play", handleVideoPlay, true);
+    document.addEventListener("loadedmetadata", handleVideoMetadata, true);
+    window.addEventListener("focus", refreshWatchedVideoState);
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") refreshWatchedVideoState();
+    });
     document.addEventListener(
       "contextmenu",
       (event) => {
@@ -2702,7 +2964,7 @@
       }
     }).observe(document.body, {
       attributes: true,
-      attributeFilter: ["class", "aria-selected", "data-selected"],
+      attributeFilter: ["class", "aria-selected", "data-selected", "src", "poster"],
       childList: true,
       subtree: true
     });
