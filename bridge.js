@@ -461,6 +461,25 @@
     );
   }
 
+  function inferAssetMediaType(asset, fallbackUrl = "") {
+    const fields = [
+      asset?.type,
+      asset?.mimeType,
+      asset?.mime,
+      asset?.contentType,
+      asset?.fileType,
+      asset?.mediaType,
+      asset?.name,
+      asset?.fileName,
+      asset?.filename,
+      fallbackUrl
+    ].map((value) => String(value || "").toLowerCase());
+    if (fields.some((value) => /video|\.mp4|\.webm|\.mov|\.m4v|\.avi|\.mkv/.test(value))) return "video";
+    if (fields.some((value) => /audio|\.mp3|\.wav|\.m4a|\.aac|\.ogg/.test(value))) return "audio";
+    if (fields.some((value) => /image|\.png|\.jpe?g|\.webp|\.gif|\.avif|\.bmp/.test(value))) return "image";
+    return "";
+  }
+
   function resolveAssetPath(asset, path) {
     if (!path) return "";
     if (/^https?:\/\//i.test(path)) return path;
@@ -1081,10 +1100,19 @@
     if (!url) return null;
 
     return {
+      mediaType: inferDomMediaType(media, url),
       name: node.querySelector("input")?.value || "",
       poster: media.poster || "",
       url
     };
+  }
+
+  function inferDomMediaType(element, url = "") {
+    const tagName = String(element?.tagName || element?.parentElement?.tagName || "").toLowerCase();
+    if (tagName === "video") return "video";
+    if (tagName === "audio") return "audio";
+    if (tagName === "img") return "image";
+    return inferAssetMediaType(null, url);
   }
 
   function buildEagleAsset(rawNodes, nodeId) {
@@ -1099,6 +1127,7 @@
     return {
       annotation: getEagleAnnotation(rawNodes, rawNode ?? {}),
       fileUuid: getCanvasIdentity().fileUuid,
+      mediaType: inferAssetMediaType(rawNode?.defaultAsset, url || fallback?.url) || fallback?.mediaType || "",
       name: getNodeLabel(rawNode ?? {}) || fallback?.name || "",
       nodeId,
       poster: resolveAssetPreviewUrl(rawNode?.defaultAsset) || fallback?.poster || "",
@@ -1138,6 +1167,7 @@
     return {
       annotation: getEagleAnnotation(rawNodes, rawNode ?? {}),
       fileUuid: getCanvasIdentity().fileUuid,
+      mediaType: inferAssetMediaType(rawNode?.defaultAsset, url || fallback?.url) || fallback?.mediaType || "",
       name: getNodeLabel(rawNode ?? {}) || fallback?.name || "",
       nodeId,
       poster: resolveAssetPreviewUrl(rawNode?.defaultAsset) || fallback?.poster || "",

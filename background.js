@@ -78,7 +78,7 @@ async function importUrlToEagle(item) {
     throw new Error("当前节点没有可导入 Eagle 的素材链接。");
   }
 
-  const name = sanitizeFilename(item?.name || filenameFromUrl(url) || "pixmax-asset");
+  const name = buildEagleItemName(item, url);
   const website = /^https?:\/\//i.test(item?.website || "")
     ? item.website
     : "https://app.pixmax.cn/";
@@ -162,6 +162,50 @@ function filenameFromUrl(value) {
   } catch {
     return "";
   }
+}
+
+function buildEagleItemName(item, url) {
+  const baseName = sanitizeFilename(item?.name || filenameFromUrl(url) || "pixmax-asset");
+  if (!isVideoAsset(item, url)) return baseName;
+  return appendTimestampToName(baseName);
+}
+
+function isVideoAsset(item, url) {
+  const haystack = [
+    item?.mediaType,
+    item?.type,
+    item?.mimeType,
+    item?.mime,
+    item?.contentType,
+    item?.name,
+    filenameFromUrl(url),
+    url
+  ]
+    .map((value) => String(value || "").toLowerCase())
+    .join(" ");
+  return /(^|\b)video(\b|\/)|视频|\.mp4(\?|#|$)|\.webm(\?|#|$)|\.mov(\?|#|$)|\.m4v(\?|#|$)|\.avi(\?|#|$)|\.mkv(\?|#|$)/i.test(haystack);
+}
+
+function appendTimestampToName(name) {
+  const timestamp = formatTimestamp(new Date());
+  const dotIndex = name.lastIndexOf(".");
+  if (dotIndex > 0 && dotIndex < name.length - 1) {
+    return `${name.slice(0, dotIndex)} ${timestamp}${name.slice(dotIndex)}`;
+  }
+  return `${name} ${timestamp}`;
+}
+
+function formatTimestamp(date) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate()),
+    "-",
+    pad(date.getHours()),
+    pad(date.getMinutes()),
+    pad(date.getSeconds())
+  ].join("");
 }
 
 function sanitizeFilename(value) {
